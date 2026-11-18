@@ -1,0 +1,37 @@
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+go.work.sum
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+python/dist/
+
+# TypeScript
+node_modules/
+typescript/lib/
+typescript/dist/
+*.tsbuildinfo
+
+# Editors
+.idea/
+.vscode/
+.DS_Store
+
+# Claude Code settings
+.claude/
+CLAUDE.local.md
+
+# git worktrees
+.worktrees/
