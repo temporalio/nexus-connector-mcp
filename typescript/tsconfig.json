@@ -1,0 +1,12 @@
+{
+  "extends": "@tsconfig/node22/tsconfig.json",
+  "compilerOptions": {
+    "composite": true,
+    "declaration": true,
+    "sourceMap": true,
+    "noUncheckedIndexedAccess": true,
+    "outDir": "./lib",
+    "rootDir": "./src"
+  },
+  "include": ["./src/**/*.ts"]
+}

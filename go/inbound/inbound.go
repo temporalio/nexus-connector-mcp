@@ -1,0 +1,87 @@
+// Package inbound serves Nexus operations as MCP tools.
+//
+// [NewServer] returns a standard [mcp.Server]. The user supplies the Temporal
+// client, the Nexus service routes, authentication middleware, and the server
+// lifecycle. The user serves the returned server over Streamable HTTP or stdio
+// with the MCP SDK transports.
+//
+// Each tool call starts a standalone Nexus operation in the connector
+// namespace and waits for its result. Clients that support the MCP tasks
+// extension can receive a task while the operation continues.
+package inbound
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.temporal.io/sdk/client"
+)
+
+// NeverReturnTask is an [Options.ReturnTaskAfter] value. The connector waits
+// for the operation to complete or for the caller to cancel. It never returns
+// a task.
+const NeverReturnTask time.Duration = -1
+
+// Service is one route from the connector to a Nexus service.
+type Service struct {
+	// Name is the Nexus service name.
+	Name string
+	// Endpoint is the Nexus endpoint name used to reach the service.
+	Endpoint string
+}
+
+// Options configures [NewServer].
+type Options struct {
+	// Client is the Temporal client for the connector namespace. Required.
+	// Its data converter must match the payload encoding of the Nexus
+	// handlers.
+	Client client.Client
+
+	// Namespace is the connector namespace. It must match the namespace of
+	// Client. Required.
+	Namespace string
+
+	// Services lists the Nexus service routes. At least one is required.
+	// tools/list merges the tools from all routes.
+	Services []Service
+
+	// ConnectorName is an optional logical deployment name. Use the same
+	// name across replicas.
+	ConnectorName string
+
+	// Logger receives connector logs. Defaults to slog.Default(). With
+	// stdio, stdout is reserved for MCP.
+	Logger *slog.Logger
+
+	// PrefixToolNames exposes every tool as {service}_{tool} when true.
+	// When false, only tool names that collide across services get the
+	// prefix.
+	PrefixToolNames bool
+
+	// ReturnTaskAfter sets how long the connector waits before it returns
+	// a task to a client that supports the MCP tasks extension.
+	//   - 0 (default): return a task right after the operation starts.
+	//   - Positive: wait up to this duration. Return the tool result if it
+	//     is ready. Otherwise return a task.
+	//   - NeverReturnTask: never return a task.
+	//   - Other negative values are invalid.
+	//
+	// It is not an operation execution timeout.
+	ReturnTaskAfter time.Duration
+
+	// CallerIdentity returns the verified caller identity as
+	// issuer#subject. The connector uses it for task ownership checks.
+	// The default reads the MCP SDK token info from the request context.
+	// Set it when the user uses other authentication middleware.
+	CallerIdentity func(context.Context) (string, bool)
+}
+
+// NewServer validates opts and returns an MCP server that maps MCP requests
+// to Nexus operations.
+func NewServer(opts Options) (*mcp.Server, error) {
+	_ = opts
+	return nil, errors.New("inbound: NewServer is not implemented")
+}

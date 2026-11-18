@@ -1,0 +1,65 @@
+name: Build and test
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+# A new push to a PR branch cancels the previous run for that branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: ${{ matrix.language }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [go, python, typescript]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          language: ${{ matrix.language }}
+      - run: mise run deps:${{ matrix.language }}
+      - run: mise run lint:${{ matrix.language }}
+      - run: mise run test:${{ matrix.language }}
+      - run: mise run build:${{ matrix.language }}
+      - name: Check for uncommitted changes
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git status --porcelain
+            git diff
+            echo "Generated or formatted files differ from the commit. Run 'mise run deps' and 'mise run format', then commit."
+            exit 1
+          fi
+
+  # The check job runs Python on the mise.toml version, which is the newest
+  # supported version. This job runs the tests on the minimum version in
+  # requires-python. uv downloads that interpreter.
+  python-min:
+    name: python (3.11)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      UV_PYTHON: "3.11"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          language: python
+      - run: mise run deps:python
+      - run: mise run test:python

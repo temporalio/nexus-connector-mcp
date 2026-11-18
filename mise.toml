@@ -1,0 +1,134 @@
+[tools]
+go = "1.27.4"
+golangci-lint = "2.15.0"
+python = "3.15"
+uv = "0.13.8"  # Keep in sync with required-version in python/pyproject.toml.
+node = "24"
+pnpm = "10.27.0"  # Keep in sync with packageManager in typescript/package.json.
+
+[env]
+# The SDK wheel owns the temporalio package. An editable install cannot add
+# temporalio.nexus_mcp to it, so uv installs the Python package as a wheel.
+UV_NO_EDITABLE = "1"
+
+################################################################################
+# Dependencies
+################################################################################
+
+[tasks."deps:go"]
+description = "Sync Go modules"
+dir = "go"
+run = "go mod tidy"
+
+[tasks."deps:python"]
+description = "Install locked Python dependencies"
+dir = "python"
+run = "uv sync --locked"
+
+[tasks."deps:typescript"]
+description = "Install locked TypeScript dependencies"
+dir = "typescript"
+run = "pnpm install --frozen-lockfile"
+
+[tasks.deps]
+description = "Install dependencies for all languages"
+depends = ["deps:*"]
+
+################################################################################
+# Lint
+################################################################################
+
+[tasks."lint:go"]
+description = "Lint Go files"
+dir = "go"
+run = ["golangci-lint run ./...", "golangci-lint fmt --diff ./..."]
+
+[tasks."lint:python"]
+description = "Lint and type-check Python files"
+dir = "python"
+run = [
+  "uv run --locked ruff check",
+  "uv run --locked ruff format --check",
+  "uv run --locked pyright",
+  "uv run --locked mypy",
+  "uv run --locked basedpyright --project basedpyrightconfig.json",
+  "uv run --locked pydocstyle src",
+]
+
+[tasks."lint:typescript"]
+description = "Lint and type-check TypeScript files"
+dir = "typescript"
+run = "pnpm run lint"
+
+[tasks.lint]
+description = "Lint all languages"
+depends = ["lint:*"]
+
+################################################################################
+# Format
+################################################################################
+
+[tasks."format:go"]
+description = "Format Go files"
+dir = "go"
+run = ["go fix ./...", "golangci-lint fmt ./..."]
+
+[tasks."format:python"]
+description = "Format Python files"
+dir = "python"
+run = ["uv run --locked ruff check --select I --fix", "uv run --locked ruff format"]
+
+[tasks."format:typescript"]
+description = "Format TypeScript files"
+dir = "typescript"
+run = "pnpm run format"
+
+[tasks.format]
+description = "Format all languages"
+depends = ["format:*"]
+
+################################################################################
+# Test
+################################################################################
+
+[tasks."test:go"]
+description = "Run Go unit tests"
+dir = "go"
+run = "go test -race -cover ./..."
+
+[tasks."test:python"]
+description = "Run Python unit tests"
+dir = "python"
+run = "uv run --locked pytest"
+
+[tasks."test:typescript"]
+description = "Run TypeScript unit tests"
+dir = "typescript"
+run = "pnpm run test"
+
+[tasks.test]
+description = "Run unit tests for all languages"
+depends = ["test:*"]
+
+################################################################################
+# Build
+################################################################################
+
+[tasks."build:go"]
+description = "Build Go packages"
+dir = "go"
+run = "go build ./..."
+
+[tasks."build:python"]
+description = "Build the Python sdist and wheel into python/dist"
+dir = "python"
+run = "uv build --no-sources --out-dir dist"
+
+[tasks."build:typescript"]
+description = "Build and pack the TypeScript package into typescript/dist"
+dir = "typescript"
+run = ["pnpm run build", "pnpm run pack"]
+
+[tasks.build]
+description = "Build all languages"
+depends = ["build:*"]

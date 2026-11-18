@@ -1,0 +1,92 @@
+[project]
+name = "temporalio-nexus-mcp"
+version = "0.0.0"  # Development placeholder. Release tooling sets the published version.
+description = "Expose Temporal Nexus operations as MCP tools and proxy upstream MCP servers through Temporal (temporalio.nexus_mcp)"
+authors = [{ name = "Temporal Technologies Inc", email = "sdk@temporal.io" }]
+requires-python = ">=3.11"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]  # Copy of the repository root LICENSE.
+classifiers = [
+  "Development Status :: 1 - Planning",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
+  "Typing :: Typed",
+]
+dependencies = [
+  "temporalio>=1.36.0,<2",
+  "mcp>=2,<3",
+]
+
+[project.urls]
+Homepage = "https://github.com/temporalio/nexus-connector-mcp/tree/main/python"
+Repository = "https://github.com/temporalio/nexus-connector-mcp"
+
+[build-system]
+requires = ["uv_build>=0.13.0,<0.14"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+# src/temporalio must not contain __init__.py. The SDK wheel owns the temporalio package.
+module-name = "temporalio.nexus_mcp"
+
+[dependency-groups]
+dev = [
+  "basedpyright>=1.40.2,<2",
+  "mypy>=1.20.2,<2",
+  "pydocstyle>=6.3,<7",
+  "pyright>=1.1.414,<2",
+  "pytest>=9.2,<10",
+  "pytest-asyncio>=1.4.1,<2",
+  "pytest-timeout~=2.2",
+  "ruff>=0.15.12,<0.16",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+required-version = ">=0.13.0,<0.14"  # Keep in sync with the uv pin in the root mise.toml.
+exclude-newer = "2 weeks"  # Supply-chain cooldown for third-party packages.
+exclude-newer-package = { temporalio = false }  # First-party SDK releases are usable on release day.
+# UV_NO_EDITABLE=1 is set in the root mise.toml. An editable install cannot add a
+# subpackage to the SDK-owned temporalio package, so uv installs this project as a
+# wheel. uv rebuilds the wheel when these files change.
+cache-keys = [{ file = "pyproject.toml" }, { file = "README.md" }, { file = "src/**/*" }]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+timeout = 60
+
+[tool.ruff]
+target-version = "py311"
+src = [".", "src"]
+
+[tool.ruff.lint.isort]
+# The SDK owns the top-level temporalio package. This project owns temporalio.nexus_mcp.
+known-first-party = ["temporalio", "tests"]
+
+[tool.mypy]
+files = ["src", "tests"]
+mypy_path = "src"
+namespace_packages = true
+explicit_package_bases = true
+check_untyped_defs = true
+
+[tool.pyright]
+include = ["src", "tests"]
+enableTypeIgnoreComments = true
+reportImplicitOverride = "none"
+reportUnusedCallResult = "none"
+
+# Resolve this project's modules from source rather than from site-packages.
+[[tool.pyright.executionEnvironments]]
+root = "."
+extraPaths = ["src"]
+
+[tool.pydocstyle]
+convention = "google"
+add_ignore = ["D205", "D415"]
