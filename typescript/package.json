@@ -1,0 +1,77 @@
+{
+  "name": "@temporalio/nexus-mcp",
+  "version": "0.0.0",
+  "description": "Expose Temporal Nexus operations as MCP tools",
+  "license": "MIT",
+  "author": "Temporal Technologies Inc. <sdk@temporal.io>",
+  "main": "lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./workflow": {
+      "types": "./lib/workflow.d.ts",
+      "default": "./lib/workflow.js"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "workflow": [
+        "./lib/workflow.d.ts"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "tsc --build",
+    "clean": "tsc --build --clean",
+    "lint": "pnpm run build && eslint src && prettier --check .",
+    "format": "prettier --write . && eslint --fix src",
+    "test": "pnpm run build && ava",
+    "pack": "pnpm pack --pack-destination dist"
+  },
+  "ava": {
+    "files": [
+      "./lib/__tests__/**/*.test.js"
+    ]
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "nexus-rpc": "^0.0.3",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.26.0",
+    "@tsconfig/node22": "^22.0.2",
+    "@types/node": "^22.18.0",
+    "ava": "^5.3.1",
+    "eslint": "^9.26.0",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-import-resolver-typescript": "^3.6.1",
+    "eslint-plugin-import": "^2.31.0",
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.10.0"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/temporalio/nexus-connector-mcp.git",
+    "directory": "typescript"
+  },
+  "homepage": "https://github.com/temporalio/nexus-connector-mcp/tree/main/typescript",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "src",
+    "lib",
+    "!src/__tests__",
+    "!lib/__tests__",
+    "LICENSE"
+  ],
+  "packageManager": "pnpm@10.27.0"
+}
