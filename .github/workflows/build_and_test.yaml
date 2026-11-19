@@ -1,9 +1,8 @@
 name: Build and test
 
 on:
+  # Run on pull requests into any branch, so stacked pull requests also run CI.
   pull_request:
-    branches:
-      - main
   push:
     branches:
       - main
