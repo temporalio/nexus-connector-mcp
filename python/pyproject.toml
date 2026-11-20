@@ -18,6 +18,7 @@ classifiers = [
 ]
 dependencies = [
   "temporalio>=1.36.0,<2",
+  "nexus-rpc>=1.5.0,<2",
   "mcp>=2,<3",
 ]
 
@@ -54,6 +55,12 @@ exclude-newer-package = { temporalio = false }  # First-party SDK releases are u
 # subpackage to the SDK-owned temporalio package, so uv installs this project as a
 # wheel. uv rebuilds the wheel when these files change.
 cache-keys = [{ file = "pyproject.toml" }, { file = "README.md" }, { file = "src/**/*" }]
+
+# The outbound proxy needs dynamic Nexus operation handlers, which are not in a
+# released SDK yet. Building temporalio from source needs Rust and protoc.
+[tool.uv.sources]
+temporalio = { git = "https://github.com/long-nt-tran/sdk-python.git", rev = "59d613f58d9499be010f75a4a6550c1869587fe7" }
+nexus-rpc = { git = "https://github.com/long-nt-tran/nexus-rpc-sdk-python.git", rev = "c88388fa0b0ddac441c3b9dc18cb5919c5f1fd96" }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
