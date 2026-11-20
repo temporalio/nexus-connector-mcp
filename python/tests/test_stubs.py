@@ -5,27 +5,7 @@ from contextlib import AbstractAsyncContextManager
 import pytest
 from mcp.client import Client
 
-from temporalio import nexus_mcp
-from temporalio.nexus_mcp import handler, outbound
-
-
-class _Service:
-    pass
-
-
-def test_service_not_implemented() -> None:
-    with pytest.raises(NotImplementedError):
-        nexus_mcp.service(_Service)
-
-
-def test_service_handler_not_implemented() -> None:
-    with pytest.raises(NotImplementedError):
-        handler.service_handler(_Service)
-
-
-def test_tool_not_implemented() -> None:
-    with pytest.raises(NotImplementedError):
-        handler.tool(title="Example")
+from temporalio.nexus_mcp import outbound
 
 
 def _client_factory() -> AbstractAsyncContextManager[Client]:
