@@ -35,32 +35,38 @@ type connector struct {
 	nexus *nexusClient
 }
 
-func newServer(c *connector) *mcp.Server {
+func newServer(c *connector) (*mcp.Server, error) {
+	caps := &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}}
+	caps.AddExtension(tasksExtension, map[string]any{})
 	s := mcp.NewServer(
 		&mcp.Implementation{Name: c.opts.ConnectorName, Version: moduleVersion()},
-		&mcp.ServerOptions{Capabilities: &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}}},
+		&mcp.ServerOptions{Capabilities: caps},
 	)
+	if err := addTaskMethods(s, c); err != nil {
+		return nil, err
+	}
 	// The tool list comes from Nexus at request time, so no tool is
 	// registered in the SDK. This middleware answers tools/list and
-	// tools/call. The SDK answers all other methods.
+	// tools/call. The SDK answers all other methods, including the tasks/*
+	// custom methods.
 	s.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
 		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			// Options.CallerIdentity reads the token info from the context.
+			ctx = context.WithValue(ctx, requestExtraKey{}, req.GetExtra())
 			switch method {
 			case "tools/list":
-				ctx = context.WithValue(ctx, requestExtraKey{}, req.GetExtra())
 				return c.listTools(ctx, operationIDPrefix(req))
 			case "tools/call":
 				callReq, ok := req.(*mcp.CallToolRequest)
 				if !ok {
 					return nil, &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: fmt.Sprintf("unexpected request type %T", req)}
 				}
-				ctx = context.WithValue(ctx, requestExtraKey{}, req.GetExtra())
 				return c.callTool(ctx, operationIDPrefix(req), callReq)
 			}
 			return next(ctx, method, req)
 		}
 	})
-	return s
+	return s, nil
 }
 
 // moduleVersion returns the version of this module in the binary, or
@@ -104,7 +110,7 @@ func (c *connector) listTools(ctx context.Context, prefix string) (*mcp.ListTool
 	if err != nil {
 		return nil, c.listToolsError(err)
 	}
-	out, err := wait(ctx, h)
+	out, err := wait(ctx, h, 0)
 	if errors.Is(err, context.DeadlineExceeded) {
 		err = fmt.Errorf("did not complete in %s; check that the handler Worker runs", listToolsTimeout)
 	}
@@ -170,7 +176,17 @@ func (c *connector) callTool(ctx context.Context, prefix string, req *mcp.CallTo
 		return mcpwire.Error(err.Error()), nil
 	}
 
-	out, err := wait(ctx, h)
+	// SEP-2663: the server decides when to create a task. It must not send
+	// one to a client that did not declare the extension on the request.
+	tasks := clientSupportsTasks(req.Params.Meta) && c.opts.ReturnTaskAfter != NeverReturnTask
+	if tasks && c.opts.ReturnTaskAfter == 0 {
+		return newCreateTaskResult(h.GetID()), nil
+	}
+	var budget time.Duration
+	if tasks {
+		budget = c.opts.ReturnTaskAfter
+	}
+	out, err := wait(ctx, h, budget)
 	if ctx.Err() != nil {
 		// The caller cancelled the tool call, so cancel the operation.
 		if cancelErr := cancelOperation(ctx, h, "cancelled by MCP client"); cancelErr != nil {
@@ -180,6 +196,10 @@ func (c *connector) callTool(ctx context.Context, prefix string, req *mcp.CallTo
 	}
 	if err != nil {
 		return nil, &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: err.Error()}
+	}
+	if out.running {
+		// The operation keeps running. The client reads it with tasks/get.
+		return newCreateTaskResult(h.GetID()), nil
 	}
 	return toCallToolResult(out), nil
 }

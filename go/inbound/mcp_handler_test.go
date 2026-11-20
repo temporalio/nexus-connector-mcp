@@ -40,14 +40,16 @@ type fakeClient struct {
 	starts        []client.StartNexusOperationOptions
 	inputs        []any
 	cancelled     []string
+	operations    map[string]*fakeHandle
 
 	nexusClients []client.NexusClientOptions
 }
 
 func newFakeClient() *fakeClient {
 	return &fakeClient{
-		toolList: tools("lookup", "slow", "fails"),
-		results:  map[string]string{"lookup": `{"answer":42}`},
+		toolList:   tools("lookup", "slow", "fails"),
+		results:    map[string]string{"lookup": `{"answer":42}`},
+		operations: map[string]*fakeHandle{},
 	}
 }
 
@@ -64,6 +66,15 @@ func (c *fakeClient) NewNexusClient(options client.NexusClientOptions) (client.N
 	defer c.mu.Unlock()
 	c.nexusClients = append(c.nexusClients, options)
 	return &fakeNexusClient{parent: c}, nil
+}
+
+func (c *fakeClient) GetNexusOperationHandle(options client.GetNexusOperationHandleOptions) client.NexusOperationHandle {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if h, ok := c.operations[options.OperationID]; ok {
+		return h
+	}
+	return &fakeHandle{parent: c, id: options.OperationID, missing: true}
 }
 
 // startedOperations returns the operation names in start order.
@@ -93,7 +104,9 @@ func (n *fakeNexusClient) ExecuteOperation(_ context.Context, operation, input a
 		return nil, errors.New("start rejected")
 	}
 	name, _ := operation.(string)
-	return &fakeHandle{parent: c, id: options.ID, operation: name}, nil
+	h := &fakeHandle{parent: c, id: options.ID, operation: name}
+	c.operations[options.ID] = h
+	return h, nil
 }
 
 type fakeHandle struct {
@@ -102,6 +115,9 @@ type fakeHandle struct {
 	parent    *fakeClient
 	id        string
 	operation string
+	missing   bool
+	// status overrides the status that Describe derives from the operation.
+	status enumspb.NexusOperationExecutionStatus
 }
 
 func (h *fakeHandle) GetID() string { return h.id }
@@ -131,9 +147,37 @@ func (h *fakeHandle) Get(ctx context.Context, out any) error {
 	return json.Unmarshal([]byte(result), out)
 }
 
+// Describe reports "slow" as running, "fails" as failed, and other
+// operations as completed, unless status is set.
+func (h *fakeHandle) Describe(context.Context, client.DescribeNexusOperationOptions) (*client.NexusOperationExecutionDescription, error) {
+	if h.missing {
+		return nil, serviceerror.NewNotFound("operation not found")
+	}
+	d := &client.NexusOperationExecutionDescription{}
+	d.ScheduledTime = time.Unix(100, 0)
+	d.Status = h.status
+	if d.Status == enumspb.NEXUS_OPERATION_EXECUTION_STATUS_UNSPECIFIED {
+		switch h.operation {
+		case "slow":
+			d.Status = enumspb.NEXUS_OPERATION_EXECUTION_STATUS_RUNNING
+		case "fails":
+			d.Status = enumspb.NEXUS_OPERATION_EXECUTION_STATUS_FAILED
+		default:
+			d.Status = enumspb.NEXUS_OPERATION_EXECUTION_STATUS_COMPLETED
+		}
+	}
+	if d.Status != enumspb.NEXUS_OPERATION_EXECUTION_STATUS_RUNNING {
+		d.CloseTime = time.Unix(200, 0)
+	}
+	return d, nil
+}
+
 func (h *fakeHandle) Cancel(ctx context.Context, _ client.CancelNexusOperationOptions) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if h.missing {
+		return serviceerror.NewNotFound("operation not found")
 	}
 	h.parent.mu.Lock()
 	defer h.parent.mu.Unlock()
