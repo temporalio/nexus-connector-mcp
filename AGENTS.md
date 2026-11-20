@@ -23,7 +23,7 @@
 | `go/`         | Go module `github.com/temporalio/nexus-connector-mcp/go`.                  |
 | `go/inbound`  | `NewServer`: returns an MCP server that maps MCP requests to Nexus.        |
 | `go/outbound` | `NewPlugin`: Worker plugin that proxies upstream MCP servers.              |
-| `go/handler`  | `Tool`, `Register`: mark Nexus operations as MCP tools.                    |
+| `go/nexusmcp` | `Tool`, `Register`: mark Nexus operations as MCP tools.                    |
 | `python/`     | `temporalio-nexus-mcp`. Source is in `python/src/temporalio/nexus_mcp`.    |
 | `typescript/` | `@temporalio/nexus-mcp`. Source is in `typescript/src`.                    |
 
