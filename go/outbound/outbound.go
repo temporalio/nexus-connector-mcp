@@ -3,11 +3,21 @@
 // [NewPlugin] returns a Worker plugin. The plugin registers one Nexus service
 // per [Upstream]. Each service lists the upstream tools and runs each tool call
 // as a standalone Activity.
+//
+// Each service has two handlers:
+//   - list_tools calls the upstream tools/list directly. It returns the last
+//     successful tool list when discovery fails.
+//   - A dynamic handler takes every other operation. The operation name is the
+//     upstream tool name. It starts a standalone Activity that calls the
+//     upstream tools/call, and returns the Activity as an async Nexus
+//     operation.
 package outbound
 
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.temporal.io/sdk/client"
@@ -16,6 +26,11 @@ import (
 
 // ClientFactory connects to an upstream MCP server over HTTP or stdio. The
 // factory owns the transport, destination, and credentials.
+//
+// The proxy calls it once for each discovery and once for each tool call
+// attempt, and closes the session after that call. A stdio factory starts one
+// process for each call. Honor ctx during setup. The session must stay open
+// after the setup context ends.
 type ClientFactory func(context.Context) (*mcp.ClientSession, error)
 
 // FailureClassification sets how a failed upstream call is reported to
@@ -55,7 +70,30 @@ type Options struct {
 
 // NewPlugin validates opts and returns a Worker plugin that registers the
 // proxy Nexus services and Activities.
+//
+// Workers that share the plugin share its tool lists. Hooks and factories
+// must support concurrent calls. Do not change opts while a Worker runs.
 func NewPlugin(opts Options) (worker.Plugin, error) {
-	_ = opts
-	return nil, errors.New("outbound: NewPlugin is not implemented")
+	if len(opts.Upstreams) == 0 {
+		return nil, errors.New("outbound: Options.Upstreams needs at least one Upstream")
+	}
+	p := &plugin{catalogs: map[string]*catalog{}, stops: map[string]func(){}}
+	for _, u := range opts.Upstreams {
+		prepared, err := prepareUpstream(u)
+		if err != nil {
+			return nil, err
+		}
+		if p.catalogs[u.Service] != nil {
+			return nil, fmt.Errorf("outbound: duplicate Upstream service %q", u.Service)
+		}
+		p.upstreams = append(p.upstreams, prepared)
+		p.catalogs[u.Service] = newCatalog(prepared)
+	}
+	return p, nil
+}
+
+// isToolName reports whether name can be an upstream tool name. list_tools
+// and names that start with __temporal_ are reserved.
+func isToolName(name string) bool {
+	return strings.TrimSpace(name) != "" && name != listToolsOperation && !strings.HasPrefix(name, reservedPrefix)
 }
