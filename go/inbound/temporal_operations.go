@@ -22,7 +22,9 @@ const (
 // nexusClient runs standalone Nexus operations on one Nexus service. It does
 // not use MCP types.
 type nexusClient struct {
-	nexus client.NexusClient
+	// client reads operations by ID.
+	client client.Client
+	nexus  client.NexusClient
 }
 
 func newNexusClient(c client.Client, endpoint, service string) (*nexusClient, error) {
@@ -30,7 +32,12 @@ func newNexusClient(c client.Client, endpoint, service string) (*nexusClient, er
 	if err != nil {
 		return nil, err
 	}
-	return &nexusClient{nexus: nc}, nil
+	return &nexusClient{client: c, nexus: nc}, nil
+}
+
+// handle returns the handle of the operation with the operation ID id.
+func (n *nexusClient) handle(id string) client.NexusOperationHandle {
+	return n.client.GetNexusOperationHandle(client.GetNexusOperationHandleOptions{OperationID: id})
 }
 
 // start starts operation with the operation ID id. A timeout of zero means no
@@ -52,25 +59,37 @@ func cancelOperation(ctx context.Context, h client.NexusOperationHandle, reason 
 	return h.Cancel(ctx, client.CancelNexusOperationOptions{Reason: reason})
 }
 
-// outcome is the result of a closed operation.
+// outcome is the state of one result read.
 type outcome struct {
+	// running is set when the read budget ended before the operation closed.
+	running bool
 	// value is the raw operation result.
 	value json.RawMessage
 	// failure is set when the operation failed.
 	failure error
 }
 
-// wait reads the result until the operation closes or ctx ends. It returns a
-// failed read as err, and a failed operation as outcome.failure.
-func wait(ctx context.Context, h client.NexusOperationHandle) (outcome, error) {
+// wait reads the result until the operation closes or ctx ends. If budget is
+// positive, it also stops after budget and returns outcome.running. It
+// returns a failed read as err, and a failed operation as outcome.failure.
+func wait(ctx context.Context, h client.NexusOperationHandle, budget time.Duration) (outcome, error) {
+	readCtx := ctx
+	if budget > 0 {
+		var cancel context.CancelFunc
+		readCtx, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
+	}
 	for {
 		var raw json.RawMessage
-		err := h.Get(ctx, &raw)
+		err := h.Get(readCtx, &raw)
 		switch {
 		case err == nil:
 			return outcome{value: raw}, nil
 		case ctx.Err() != nil:
 			return outcome{}, ctx.Err()
+		case readCtx.Err() != nil:
+			// The budget ended. The operation keeps running.
+			return outcome{running: true}, nil
 		case isRPCDeadline(err):
 			// One poll RPC ended on its own deadline. The caller still waits,
 			// so read again.
