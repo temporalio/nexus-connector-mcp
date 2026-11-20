@@ -9,8 +9,7 @@ Python package for the Nexus MCP connector. Import path: `temporalio.nexus_mcp`.
 
 | Feature | Module | Entry points |
 | --- | --- | --- |
-| Authoring: marks Nexus operations as MCP tools. | `temporalio.nexus_mcp` | `service`. Safe to import in Workflow code. |
-| | `temporalio.nexus_mcp.handler` | `service_handler`, `tool`. Nexus handler code only. |
+| Authoring: marks Nexus operations as MCP tools. | `temporalio.nexus_mcp` | `service`, `service_handler`, `tool`. Safe to import in Workflow code. |
 | Workflow client: calls Nexus-backed MCP tools from Workflow code. | `temporalio.nexus_mcp.workflow` | `NexusMCPClient`. |
 | Outbound proxy: runs upstream MCP tool calls as Activities behind a Nexus service. | `temporalio.nexus_mcp.outbound` | `MCPProxyPlugin`, `Options`, `Upstream`. |
 

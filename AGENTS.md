@@ -68,8 +68,9 @@ cd python && uv run pytest tests/test_stubs.py -k proxy
 - The SDK wheel owns the `temporalio` package. Do not add `__init__.py` to `python/src/temporalio`.
 - uv installs this package as a wheel, not in editable mode. The root `mise.toml` sets
   `UV_NO_EDITABLE=1`. Run Python commands through `mise run` or from a shell with mise activated.
-- `temporalio.nexus_mcp` and `temporalio.nexus_mcp.workflow` must stay safe to import in Workflow
-  code. Put handler-only imports in `temporalio.nexus_mcp.handler`.
+- `temporalio.nexus_mcp`, `temporalio.nexus_mcp.handler`, and `temporalio.nexus_mcp.workflow` must
+  stay safe to import in Workflow code. `temporalio.nexus_mcp` imports `handler` to export
+  `service_handler` and `tool`.
 - Type checkers: pyright, mypy, and basedpyright (`python/basedpyrightconfig.json`). Docstrings use
   the Google convention.
 
