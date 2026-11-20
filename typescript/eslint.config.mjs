@@ -2,6 +2,7 @@
 import js from '@eslint/js';
 import prettierConfig from 'eslint-config-prettier';
 import importPlugin from 'eslint-plugin-import';
+import { defaultConditionNames } from 'eslint-import-resolver-typescript';
 import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
@@ -15,7 +16,16 @@ export default tseslint.config(
     },
     settings: {
       'import/parsers': { '@typescript-eslint/parser': ['.ts'] },
-      'import/resolver': { typescript: { alwaysTryTypes: true, project: ['./tsconfig.json'] } },
+      'import/resolver': {
+        typescript: {
+          alwaysTryTypes: true,
+          project: ['./tsconfig.json'],
+          // The MCP SDK wildcard types export maps `.js` imports to `.js.d.ts` files that do
+          // not exist. Resolve the runtime exports. Extension aliases still find the
+          // declarations.
+          conditionNames: defaultConditionNames.filter((condition) => condition !== 'types'),
+        },
+      },
       'import/internal-regex': '^@temporalio/',
     },
     rules: {

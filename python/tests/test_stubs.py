@@ -6,7 +6,7 @@ import pytest
 from mcp.client import Client
 
 from temporalio import nexus_mcp
-from temporalio.nexus_mcp import handler, outbound, workflow
+from temporalio.nexus_mcp import handler, outbound
 
 
 class _Service:
@@ -26,11 +26,6 @@ def test_service_handler_not_implemented() -> None:
 def test_tool_not_implemented() -> None:
     with pytest.raises(NotImplementedError):
         handler.tool(title="Example")
-
-
-def test_nexus_mcp_client_not_implemented() -> None:
-    with pytest.raises(NotImplementedError):
-        workflow.NexusMCPClient(service="example", endpoint="example-endpoint")
 
 
 def _client_factory() -> AbstractAsyncContextManager[Client]:
