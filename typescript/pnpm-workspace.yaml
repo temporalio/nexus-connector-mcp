@@ -1,0 +1,7 @@
+# Minimum release age, in minutes (2 weeks).
+minimumReleaseAge: 20160
+
+# First-party packages are usable on release day.
+minimumReleaseAgeExclude:
+  - '@temporalio/*'
+  - nexus-rpc

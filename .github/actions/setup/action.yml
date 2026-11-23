@@ -1,0 +1,33 @@
+name: setup
+description: Install the mise toolchain and restore the dependency cache for one language
+
+inputs:
+  language:
+    description: "One of: go, python, typescript"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+    - if: inputs.language == 'go'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+          ~/.cache/golangci-lint
+        key: ${{ runner.os }}-go-${{ hashFiles('go/go.sum', 'go/.golangci.yaml', 'mise.toml') }}
+        restore-keys: ${{ runner.os }}-go-
+    - if: inputs.language == 'python'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/uv
+        key: ${{ runner.os }}-uv-${{ hashFiles('python/uv.lock', 'mise.toml') }}
+        restore-keys: ${{ runner.os }}-uv-
+    - if: inputs.language == 'typescript'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.local/share/pnpm/store
+        key: ${{ runner.os }}-pnpm-${{ hashFiles('typescript/pnpm-lock.yaml', 'mise.toml') }}
+        restore-keys: ${{ runner.os }}-pnpm-
