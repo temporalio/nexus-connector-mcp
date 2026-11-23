@@ -22,6 +22,7 @@ updates:
     groups:
       go:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   - package-ecosystem: uv
     directory: /python
@@ -32,6 +33,7 @@ updates:
     groups:
       python:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   - package-ecosystem: npm
     directory: /typescript
@@ -42,3 +44,4 @@ updates:
     groups:
       typescript:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
