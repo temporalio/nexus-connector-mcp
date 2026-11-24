@@ -1,8 +1,15 @@
 // Package outbound runs calls to upstream MCP servers as Temporal Activities.
 //
 // [NewPlugin] returns a Worker plugin. The plugin registers one Nexus service
-// per [Upstream]. Each service has a list_tools operation that calls the
-// upstream tools/list directly.
+// per [Upstream]. Each service lists the upstream tools and runs each tool call
+// as a standalone Activity.
+//
+// Each service has two handlers:
+//   - list_tools calls the upstream tools/list directly.
+//   - A dynamic handler takes every other operation. The operation name is the
+//     upstream tool name. It starts a standalone Activity that calls the
+//     upstream tools/call, and returns the Activity as an async Nexus
+//     operation.
 package outbound
 
 import (
@@ -25,8 +32,8 @@ const (
 // ClientFactory connects to an upstream MCP server over HTTP or stdio. The
 // factory owns the transport, destination, and credentials.
 //
-// The proxy calls it once for each list_tools call, and closes the session
-// after that call. A stdio factory starts one process for each call. Honor
+// The proxy calls it once for each list_tools call and once for each tool call
+// attempt, and closes the session after that call. A stdio factory starts one process for each call. Honor
 // ctx during setup. The session must stay open after the setup context ends.
 type ClientFactory func(context.Context) (*mcp.ClientSession, error)
 
@@ -70,7 +77,7 @@ type Options struct {
 }
 
 // NewPlugin validates opts and returns a Worker plugin that registers the
-// proxy Nexus services.
+// proxy Nexus services and Activities.
 //
 // Factories must support concurrent calls. Do not change opts while a Worker
 // runs.
