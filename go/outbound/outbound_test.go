@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"net/url"
+	"os"
+	"os/exec"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -14,6 +17,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/nexus-rpc/sdk-go/nexus"
 	"github.com/stretchr/testify/require"
@@ -103,8 +107,6 @@ func TestNewPluginValidatesOptions(t *testing.T) {
 		"no factory":       {Options{Upstreams: []Upstream{{Service: "tools"}}}, "needs a ClientFactory"},
 		"overrides": {Options{Upstreams: []Upstream{{Service: "tools", ClientFactory: factory,
 			ActivityOptionsOverrides: map[string]client.StartActivityOptions{"tool": {}}}}}, "not implemented"},
-		"classify hook": {Options{Upstreams: []Upstream{{Service: "tools", ClientFactory: factory,
-			ClassifyError: func(_ error, def FailureClassification) FailureClassification { return def }}}}, "not implemented"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -462,6 +464,7 @@ func TestCallActivityRejectsIncompleteResults(t *testing.T) {
 		upstream := &fakeUpstream{call: func(context.Context, *mcp.CallToolParams) (*mcp.CallToolResult, error) { return &incomplete, nil }}
 		_, err := callTool(t.Context(), prepared(t, Upstream{ClientFactory: upstream.factory(t)}), "incomplete", nil)
 		require.ErrorIs(t, err, errProtocol, kind)
+		require.Equal(t, failureProtocol, defaultClassification(err).Type)
 	}
 }
 
@@ -474,7 +477,46 @@ func TestCallActivityFailuresHoldOnlyTheType(t *testing.T) {
 	_, err := runActivity(t, u, callToolInput{Tool: "echo"})
 	var appErr *temporal.ApplicationError
 	require.ErrorAs(t, err, &appErr)
-	require.Equal(t, failureUpstream, appErr.Type())
-	require.True(t, appErr.NonRetryable())
+	require.Equal(t, failureConnection, appErr.Type())
+	require.False(t, appErr.NonRetryable())
 	require.NotContains(t, err.Error(), "secret")
+
+	// The hook can change the type and retryability.
+	u.ClassifyError = func(_ error, def FailureClassification) FailureClassification {
+		require.Equal(t, failureConnection, def.Type)
+		return FailureClassification{Type: "CustomFailure"}
+	}
+	_, err = runActivity(t, u, callToolInput{Tool: "echo"})
+	require.ErrorAs(t, err, &appErr)
+	require.Equal(t, "CustomFailure", appErr.Type())
+	require.True(t, appErr.NonRetryable())
+
+	// A hook that panics gives a configuration failure without its value.
+	u.ClassifyError = func(error, FailureClassification) FailureClassification { panic("private-hook-value") }
+	_, err = runActivity(t, u, callToolInput{Tool: "echo"})
+	require.ErrorAs(t, err, &appErr)
+	require.Equal(t, failureConfiguration, appErr.Type())
+	require.True(t, appErr.NonRetryable())
+	require.NotContains(t, err.Error(), "private")
+}
+
+func TestDefaultClassification(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		err       error
+		failure   string
+		retryable bool
+	}{
+		{os.ErrPermission, failureAuthentication, false},
+		{&exec.Error{Name: "missing", Err: exec.ErrNotFound}, failureConfiguration, false},
+		{&jsonrpc.Error{Code: jsonrpc.CodeInvalidParams}, failureProtocol, false},
+		{&url.Error{Op: "Post", URL: "bad", Err: errors.New("unsupported protocol scheme")}, failureProtocol, false},
+		{fmt.Errorf("call: %w", mcp.ErrConnectionClosed), failureConnection, true},
+		{context.DeadlineExceeded, failureConnection, true},
+		{errors.New("other"), failureOther, false},
+	} {
+		got := defaultClassification(test.err)
+		require.Equal(t, FailureClassification{Type: test.failure, Retryable: test.retryable}, got, test.err.Error())
+	}
 }
