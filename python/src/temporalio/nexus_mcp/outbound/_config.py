@@ -45,8 +45,7 @@ class Upstream:
             are rejected: Activity ID, task queue, conflict and reuse
             policies, and RPC settings. Not implemented yet.
         classify_error: Optionally overrides the built-in classification of
-            a failed upstream call. Cancellation skips this hook. Not
-            implemented yet.
+            a failed upstream call. Cancellation skips this hook.
     """
 
     service: str

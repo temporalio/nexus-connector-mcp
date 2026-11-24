@@ -9,7 +9,7 @@ from ._nexus_handler import call_tool_activity, service_handler
 class MCPProxyPlugin(temporalio.plugin.SimplePlugin):
     """Worker plugin that registers the proxy Nexus services and Activities.
 
-    Factories must support concurrent calls.
+    Factories and hooks must support concurrent calls.
     """
 
     def __init__(self, *, options: Options) -> None:
@@ -36,10 +36,6 @@ class MCPProxyPlugin(temporalio.plugin.SimplePlugin):
             if u.activity_options_overrides:
                 raise NotImplementedError(
                     f"Upstream {u.service!r}: activity_options_overrides is not implemented yet"
-                )
-            if u.classify_error is not None:
-                raise NotImplementedError(
-                    f"Upstream {u.service!r}: classify_error is not implemented yet"
                 )
         activities = [call_tool_activity(u) for u in upstreams]
         super().__init__(
