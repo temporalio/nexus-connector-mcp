@@ -12,8 +12,10 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 	"unicode/utf8"
 
@@ -40,9 +42,8 @@ type fakeUpstream struct {
 }
 
 // session returns a real MCP client session whose tools/list and tools/call
-// go to f. The
-// client middleware lets f return failures and malformed data that a real
-// server would not send.
+// go to f. The client middleware lets f return failures and malformed data
+// that a real server would not send.
 func (f *fakeUpstream) session(t *testing.T) *mcp.ClientSession {
 	t.Helper()
 	server := mcp.NewServer(&mcp.Implementation{Name: "upstream", Version: "1"}, nil)
@@ -72,6 +73,16 @@ func (f *fakeUpstream) session(t *testing.T) *mcp.ClientSession {
 
 func (f *fakeUpstream) factory(t *testing.T) ClientFactory {
 	return func(context.Context) (*mcp.ClientSession, error) { return f.session(t), nil }
+}
+
+func listing(names ...string) func(context.Context, *mcp.ListToolsParams) (*mcp.ListToolsResult, error) {
+	return func(context.Context, *mcp.ListToolsParams) (*mcp.ListToolsResult, error) {
+		tools := make([]*mcp.Tool, 0, len(names))
+		for _, name := range names {
+			tools = append(tools, &mcp.Tool{Name: name})
+		}
+		return &mcp.ListToolsResult{Tools: tools}, nil
+	}
 }
 
 // discardLogger drops the logs of functions that tests call outside a Nexus
@@ -122,7 +133,20 @@ func TestNewPluginValidatesOptions(t *testing.T) {
 	require.Equal(t, pluginName, p.Name())
 }
 
-func TestListToolsReadsAllPagesAndKeepsMetadata(t *testing.T) {
+func TestActivityID(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, "mcp-outbound-endpoint-service-tool-request", activityID("endpoint", "service", "tool", "request"))
+	long := activityID("endpoint", "service", "tool", strings.Repeat("x", 2000))
+	require.Len(t, long, maxActivityIDBytes)
+	require.Regexp(t, "^mcp-outbound-endpoint-service-tool-x+-[0-9a-f]{64}$", long)
+	require.NotEqual(t, long, activityID("endpoint", "service", "tool", strings.Repeat("x", 2001)))
+	multibyte := activityID("endpoint", "service", "tool", strings.Repeat("é", 600))
+	require.True(t, utf8.ValidString(multibyte))
+	require.LessOrEqual(t, len(multibyte), maxActivityIDBytes)
+}
+
+func TestToolCacheReadsAllPagesAndKeepsMetadata(t *testing.T) {
 	t.Parallel()
 
 	var closes atomic.Int32
@@ -139,7 +163,8 @@ func TestListToolsReadsAllPagesAndKeepsMetadata(t *testing.T) {
 	upstream := &fakeUpstream{closes: &closes, list: func(_ context.Context, p *mcp.ListToolsParams) (*mcp.ListToolsResult, error) {
 		return pages[p.Cursor], nil
 	}}
-	tools, err := handleListTools(t.Context(), discardLogger, prepared(t, Upstream{ClientFactory: upstream.factory(t)}))
+	c := newToolCache(prepared(t, Upstream{ClientFactory: upstream.factory(t)}))
+	tools, err := c.listTools(t.Context(), discardLogger)
 	require.NoError(t, err)
 	require.Len(t, tools, 2)
 	require.Equal(t, "object", tools[0].InputSchema.(map[string]any)["type"])
@@ -164,7 +189,7 @@ func TestListToolsResultHasOnlyTools(t *testing.T) {
 	u := prepared(t, Upstream{ClientFactory: upstream.factory(t)})
 	var suite testsuite.WorkflowTestSuite
 	env := suite.NewTestWorkflowEnvironment()
-	env.RegisterNexusService(newService(u, activityName(u.Service)))
+	env.RegisterNexusService(newService(u, newToolCache(u), activityName(u.Service)))
 	env.ExecuteWorkflow(func(ctx workflow.Context) (map[string]json.RawMessage, error) {
 		var result map[string]json.RawMessage
 		err := workflow.NewNexusClient("endpoint", u.Service).
@@ -178,15 +203,57 @@ func TestListToolsResultHasOnlyTools(t *testing.T) {
 	require.Equal(t, []string{"tools"}, slices.Collect(maps.Keys(result)))
 }
 
-func TestListToolsRejectsBadLists(t *testing.T) {
+func TestToolCacheFollowsUpstreamChangesAndKeepsListOnFailure(t *testing.T) {
 	t.Parallel()
 
-	var page *mcp.ListToolsResult
-	upstream := &fakeUpstream{list: func(context.Context, *mcp.ListToolsParams) (*mcp.ListToolsResult, error) { return page, nil }}
-	u := prepared(t, Upstream{ClientFactory: upstream.factory(t)})
-	page = &mcp.ListToolsResult{Tools: []*mcp.Tool{{Name: "weather.lookup"}, {Name: strings.Repeat("x", 100)}}}
-	_, err := listTools(t.Context(), u)
+	names := []string{"a"}
+	var fail atomic.Bool
+	attempts := 0
+	upstream := &fakeUpstream{list: func(context.Context, *mcp.ListToolsParams) (*mcp.ListToolsResult, error) {
+		return listing(names...)(context.Background(), nil)
+	}}
+	c := newToolCache(prepared(t, Upstream{ClientFactory: func(context.Context) (*mcp.ClientSession, error) {
+		attempts++
+		if fail.Load() {
+			return nil, errors.New("offline")
+		}
+		return upstream.session(t), nil
+	}}))
+
+	first, err := c.listTools(t.Context(), discardLogger)
 	require.NoError(t, err)
+	require.Equal(t, "a", first[0].Name)
+
+	names = []string{"b", "c"}
+	next, err := c.listTools(t.Context(), discardLogger)
+	require.NoError(t, err)
+	require.Equal(t, []string{"b", "c"}, []string{next[0].Name, next[1].Name})
+
+	// A failed discovery keeps the last list. The backoff skips the next
+	// discovery.
+	fail.Store(true)
+	for range 2 {
+		next, err = c.listTools(t.Context(), discardLogger)
+		require.NoError(t, err)
+		require.Equal(t, "b", next[0].Name)
+	}
+	require.Equal(t, 3, attempts)
+	tool, err := c.findTool(t.Context(), discardLogger, "c")
+	require.NoError(t, err)
+	require.Equal(t, "c", tool.Name)
+	_, err = c.findTool(t.Context(), discardLogger, "a")
+	require.ErrorIs(t, err, errToolNotFound)
+}
+
+func TestToolCacheRejectsBadListsAndKeepsPreviousList(t *testing.T) {
+	t.Parallel()
+
+	page := &mcp.ListToolsResult{Tools: []*mcp.Tool{{Name: "weather.lookup"}, {Name: strings.Repeat("x", 100)}}}
+	upstream := &fakeUpstream{list: func(context.Context, *mcp.ListToolsParams) (*mcp.ListToolsResult, error) { return page, nil }}
+	c := newToolCache(prepared(t, Upstream{ClientFactory: upstream.factory(t)}))
+	previous, err := c.listTools(t.Context(), discardLogger)
+	require.NoError(t, err)
+	require.Equal(t, "weather.lookup", previous[0].Name)
 
 	for _, bad := range [][]*mcp.Tool{
 		{{Name: "list_tools"}},
@@ -194,72 +261,74 @@ func TestListToolsRejectsBadLists(t *testing.T) {
 		{{Name: "dup"}, {Name: "dup"}},
 	} {
 		page = &mcp.ListToolsResult{Tools: bad}
-		_, err := listTools(t.Context(), u)
-		require.Error(t, err)
+		c.mu.Lock()
+		c.nextDiscoveryAt = time.Time{}
+		c.mu.Unlock()
+		require.Error(t, c.refresh(t.Context()))
+		current, err := c.listTools(t.Context(), discardLogger)
+		require.NoError(t, err)
+		require.Equal(t, previous, current)
 	}
 }
 
-func TestHandleListToolsFailureIsUnavailable(t *testing.T) {
+func TestToolCacheWithoutDiscoveryIsUnavailable(t *testing.T) {
 	t.Parallel()
 
-	u := prepared(t, Upstream{ClientFactory: func(context.Context) (*mcp.ClientSession, error) {
-		return nil, errors.New("dial https://private.example.com?token=secret")
-	}})
-	_, err := handleListTools(t.Context(), discardLogger, u)
-	var handlerErr *nexus.HandlerError
-	require.ErrorAs(t, err, &handlerErr)
-	require.Equal(t, nexus.HandlerErrorTypeUnavailable, handlerErr.Type)
-	require.NotContains(t, err.Error(), "secret")
+	c := newToolCache(prepared(t, Upstream{}))
+	_, err := c.listTools(t.Context(), discardLogger)
+	require.ErrorIs(t, err, errToolListUnavailable)
+	_, err = c.findTool(t.Context(), discardLogger, "a")
+	require.ErrorIs(t, err, errToolListUnavailable)
 }
 
-// testRegistry records the registrations of the plugin.
-type testRegistry struct {
-	worker.Worker
-
-	activities []string
-	services   []*nexus.Service
-}
-
-func (r *testRegistry) RegisterActivityWithOptions(_ any, options activity.RegisterOptions) {
-	r.activities = append(r.activities, options.Name)
-}
-
-func (r *testRegistry) RegisterNexusService(service *nexus.Service) {
-	r.services = append(r.services, service)
-}
-
-func TestPluginRegistersHandlers(t *testing.T) {
+func TestToolCacheWithNoUpstreamToolsIsDiscovered(t *testing.T) {
 	t.Parallel()
 
-	p, err := NewPlugin(Options{Upstreams: []Upstream{{Service: "tools", ClientFactory: func(context.Context) (*mcp.ClientSession, error) {
-		return nil, errors.New("not connected")
-	}}}})
+	upstream := &fakeUpstream{list: listing()}
+	c := newToolCache(prepared(t, Upstream{ClientFactory: upstream.factory(t)}))
+	tools, err := c.listTools(t.Context(), discardLogger)
 	require.NoError(t, err)
-	registry := &testRegistry{}
-	started := false
-	err = p.(*plugin).StartWorker(t.Context(), worker.PluginStartWorkerOptions{WorkerRegistry: registry},
-		func(context.Context, worker.PluginStartWorkerOptions) error { started = true; return nil })
-	require.NoError(t, err)
-	require.True(t, started)
-	require.Equal(t, []string{"mcp-outbound.tools.call_upstream_tool"}, registry.activities)
-	require.Len(t, registry.services, 1)
-	require.Equal(t, "tools", registry.services[0].Name)
-	require.NotNil(t, registry.services[0].Operation("list_tools"))
-	// Every other name goes to the dynamic handler.
-	require.NotNil(t, registry.services[0].Operation("any_tool"))
+	require.Empty(t, tools)
+	_, err = c.findTool(t.Context(), discardLogger, "a")
+	require.ErrorIs(t, err, errToolNotFound)
 }
 
-func TestActivityID(t *testing.T) {
+func TestToolCacheBackoffAndRecovery(t *testing.T) {
 	t.Parallel()
 
-	require.Equal(t, "mcp-outbound-endpoint-service-tool-request", activityID("endpoint", "service", "tool", "request"))
-	long := activityID("endpoint", "service", "tool", strings.Repeat("x", 2000))
-	require.Len(t, long, maxActivityIDBytes)
-	require.Regexp(t, "^mcp-outbound-endpoint-service-tool-x+-[0-9a-f]{64}$", long)
-	require.NotEqual(t, long, activityID("endpoint", "service", "tool", strings.Repeat("x", 2001)))
-	multibyte := activityID("endpoint", "service", "tool", strings.Repeat("é", 600))
-	require.True(t, utf8.ValidString(multibyte))
-	require.LessOrEqual(t, len(multibyte), maxActivityIDBytes)
+	synctest.Test(t, func(t *testing.T) {
+		attempts := 0
+		fail := true
+		upstream := &fakeUpstream{list: listing("recovered")}
+		c := newToolCache(prepared(t, Upstream{ClientFactory: func(context.Context) (*mcp.ClientSession, error) {
+			attempts++
+			if fail {
+				return nil, errors.New("private-token")
+			}
+			return upstream.session(t), nil
+		}}))
+		for i := range 9 {
+			require.Error(t, c.refresh(t.Context()))
+			expected := min(time.Second*time.Duration(1<<i), time.Minute)
+			require.Equal(t, expected, c.backoff)
+			wait := time.Until(c.nextDiscoveryAt)
+			require.GreaterOrEqual(t, wait, expected/2)
+			require.LessOrEqual(t, wait, expected)
+			// Calls during the backoff do not reach the upstream.
+			for range 5 {
+				require.NoError(t, c.refresh(t.Context()))
+			}
+			require.Equal(t, i+1, attempts)
+			time.Sleep(wait)
+		}
+		fail = false
+		require.NoError(t, c.refresh(t.Context()))
+		require.Zero(t, c.backoff)
+		require.True(t, c.nextDiscoveryAt.IsZero())
+		tools, err := c.listTools(t.Context(), discardLogger)
+		require.NoError(t, err)
+		require.Equal(t, "recovered", tools[0].Name)
+	})
 }
 
 // toolCall is one run of the call Activity.
@@ -270,7 +339,7 @@ type toolCall struct {
 
 // runToolCall starts operation on the proxy service from a test Workflow. A
 // recording Activity replaces the call Activity, so no upstream call runs.
-func runToolCall(t *testing.T, u *Upstream, operation string, input any) ([]toolCall, json.RawMessage, error) {
+func runToolCall(t *testing.T, u *Upstream, c *toolCache, operation string, input any) ([]toolCall, json.RawMessage, error) {
 	t.Helper()
 	var suite testsuite.WorkflowTestSuite
 	env := suite.NewTestWorkflowEnvironment()
@@ -280,7 +349,7 @@ func runToolCall(t *testing.T, u *Upstream, operation string, input any) ([]tool
 		calls = append(calls, toolCall{input: call, info: activity.GetInfo(ctx)})
 		return json.RawMessage(`{"done":true}`), nil
 	}, activity.RegisterOptions{Name: name})
-	env.RegisterNexusService(newService(u, name))
+	env.RegisterNexusService(newService(u, c, name))
 	caller := func(ctx workflow.Context) (json.RawMessage, error) {
 		var out json.RawMessage
 		err := workflow.NewNexusClient("weather-endpoint", u.Service).
@@ -299,6 +368,35 @@ func runToolCall(t *testing.T, u *Upstream, operation string, input any) ([]tool
 	return calls, out, nil
 }
 
+// weatherUpstream lists tools a and b, and counts the upstream connections.
+type weatherUpstream struct {
+	mu       sync.Mutex
+	tools    []string
+	connects atomic.Int32
+}
+
+func newWeatherUpstream(t *testing.T) (*weatherUpstream, *Upstream) {
+	t.Helper()
+	w := &weatherUpstream{tools: []string{"a", "b"}}
+	fake := &fakeUpstream{list: func(ctx context.Context, p *mcp.ListToolsParams) (*mcp.ListToolsResult, error) {
+		w.mu.Lock()
+		names := slices.Clone(w.tools)
+		w.mu.Unlock()
+		return listing(names...)(ctx, p)
+	}}
+	u := prepared(t, Upstream{Service: "weather", ClientFactory: func(context.Context) (*mcp.ClientSession, error) {
+		w.connects.Add(1)
+		return fake.session(t), nil
+	}})
+	return w, u
+}
+
+func (w *weatherUpstream) add(name string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.tools = append(w.tools, name)
+}
+
 // requireHandlerError requires that err holds a Nexus handler error of type
 // want.
 func requireHandlerError(t *testing.T, err error, want nexus.HandlerErrorType) {
@@ -311,8 +409,10 @@ func requireHandlerError(t *testing.T, err error, want nexus.HandlerErrorType) {
 func TestNewStartUsesDefaultOptionsAndStableIdentity(t *testing.T) {
 	t.Parallel()
 
-	u := prepared(t, Upstream{Service: "weather", ClientFactory: (&fakeUpstream{}).factory(t)})
-	calls, out, err := runToolCall(t, u, "a", map[string]any{"x": 1})
+	_, u := newWeatherUpstream(t)
+	c := newToolCache(u)
+	require.NoError(t, c.refresh(t.Context()))
+	calls, out, err := runToolCall(t, u, c, "a", map[string]any{"x": 1})
 	require.NoError(t, err)
 	require.JSONEq(t, `{"done":true}`, string(out))
 	require.Len(t, calls, 1)
@@ -322,27 +422,56 @@ func TestNewStartUsesDefaultOptionsAndStableIdentity(t *testing.T) {
 	require.Equal(t, defaultStartToCloseTimeout, calls[0].info.StartToCloseTimeout)
 }
 
-func TestToolCallDoesNotReadTheToolList(t *testing.T) {
+func TestUnknownToolAndMissingDiscovery(t *testing.T) {
 	t.Parallel()
 
-	var connects atomic.Int32
 	u := prepared(t, Upstream{Service: "weather", ClientFactory: func(context.Context) (*mcp.ClientSession, error) {
-		connects.Add(1)
-		return nil, errors.New("not connected")
+		return nil, errors.New("offline")
 	}})
-	// The upstream does not list this tool. The upstream call fails for it.
-	calls, _, err := runToolCall(t, u, "missing", map[string]any{})
+	calls, _, err := runToolCall(t, u, newToolCache(u), "a", map[string]any{})
+	requireHandlerError(t, err, nexus.HandlerErrorTypeUnavailable)
+	require.Empty(t, calls)
+
+	// A tool call fills an empty cache. A tool that the upstream does not list
+	// is not found.
+	_, u = newWeatherUpstream(t)
+	calls, _, err = runToolCall(t, u, newToolCache(u), "missing", map[string]any{})
+	requireHandlerError(t, err, nexus.HandlerErrorTypeNotFound)
+	require.Empty(t, calls)
+}
+
+func TestCacheHitMakesNoUpstreamCallAndMissRefreshesOnce(t *testing.T) {
+	t.Parallel()
+
+	w, u := newWeatherUpstream(t)
+	c := newToolCache(u)
+	require.NoError(t, c.refresh(t.Context()))
+	_, _, err := runToolCall(t, u, c, "a", map[string]any{})
 	require.NoError(t, err)
-	require.Zero(t, connects.Load())
+	require.Equal(t, int32(1), w.connects.Load())
+
+	// A tool that is new upstream is a cache miss, so the call refreshes once.
+	w.add("c")
+	_, _, err = runToolCall(t, u, c, "c", map[string]any{})
+	require.NoError(t, err)
+	require.Equal(t, int32(2), w.connects.Load())
+}
+
+func TestToolCallFillsAnEmptyCache(t *testing.T) {
+	t.Parallel()
+
+	w, u := newWeatherUpstream(t)
+	calls, _, err := runToolCall(t, u, newToolCache(u), "a", map[string]any{})
+	require.NoError(t, err)
+	require.Equal(t, int32(1), w.connects.Load())
 	require.Len(t, calls, 1)
-	require.Equal(t, "missing", calls[0].input.Tool)
 }
 
 func TestNullArgumentsBecomeEmptyObject(t *testing.T) {
 	t.Parallel()
 
-	u := prepared(t, Upstream{Service: "weather", ClientFactory: (&fakeUpstream{}).factory(t)})
-	calls, _, err := runToolCall(t, u, "b", nil)
+	_, u := newWeatherUpstream(t)
+	calls, _, err := runToolCall(t, u, newToolCache(u), "b", nil)
 	require.NoError(t, err)
 	require.Len(t, calls, 1)
 	require.JSONEq(t, `{}`, string(calls[0].input.Arguments))
@@ -355,8 +484,8 @@ func TestNonObjectArgumentsAreBadRequests(t *testing.T) {
 		t.Run(fmt.Sprint(value), func(t *testing.T) {
 			t.Parallel()
 
-			u := prepared(t, Upstream{Service: "weather", ClientFactory: (&fakeUpstream{}).factory(t)})
-			calls, _, err := runToolCall(t, u, "a", value)
+			_, u := newWeatherUpstream(t)
+			calls, _, err := runToolCall(t, u, newToolCache(u), "a", value)
 			requireHandlerError(t, err, nexus.HandlerErrorTypeBadRequest)
 			require.Empty(t, calls)
 		})
@@ -370,8 +499,8 @@ func TestInvalidToolNamesAreNotFound(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			u := prepared(t, Upstream{Service: "weather", ClientFactory: (&fakeUpstream{}).factory(t)})
-			calls, _, err := runToolCall(t, u, name, map[string]any{})
+			_, u := newWeatherUpstream(t)
+			calls, _, err := runToolCall(t, u, newToolCache(u), name, map[string]any{})
 			requireHandlerError(t, err, nexus.HandlerErrorTypeNotFound)
 			require.Empty(t, calls)
 		})
@@ -519,4 +648,83 @@ func TestDefaultClassification(t *testing.T) {
 		got := defaultClassification(test.err)
 		require.Equal(t, FailureClassification{Type: test.failure, Retryable: test.retryable}, got, test.err.Error())
 	}
+}
+
+// testRegistry records the registrations of the plugin.
+type testRegistry struct {
+	worker.Worker
+
+	activities []string
+	services   []*nexus.Service
+}
+
+func (r *testRegistry) RegisterActivityWithOptions(_ any, options activity.RegisterOptions) {
+	r.activities = append(r.activities, options.Name)
+}
+
+func (r *testRegistry) RegisterNexusService(service *nexus.Service) {
+	r.services = append(r.services, service)
+}
+
+func TestPluginRegistersHandlers(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	p, err := NewPlugin(Options{Upstreams: []Upstream{{Service: "tools", ClientFactory: func(context.Context) (*mcp.ClientSession, error) {
+		calls.Add(1)
+		return nil, errors.New("not connected")
+	}}}})
+	require.NoError(t, err)
+	registry := &testRegistry{}
+	started := false
+	err = p.(*plugin).StartWorker(t.Context(), worker.PluginStartWorkerOptions{WorkerRegistry: registry},
+		func(context.Context, worker.PluginStartWorkerOptions) error { started = true; return nil })
+	require.NoError(t, err)
+	require.True(t, started)
+	// The Worker starts without discovery, so it starts while an upstream is
+	// down.
+	require.Zero(t, calls.Load())
+	require.Equal(t, []string{"mcp-outbound.tools.call_upstream_tool"}, registry.activities)
+	require.Len(t, registry.services, 1)
+	require.NotNil(t, registry.services[0].Operation("list_tools"))
+	// Every other name goes to the dynamic handler.
+	require.NotNil(t, registry.services[0].Operation("any_tool"))
+}
+func TestDiscoveryChangesToolsWithoutReplacingHandlers(t *testing.T) {
+	t.Parallel()
+
+	names := []string{"a"}
+	var gate bool
+	entered, release := make(chan struct{}), make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
+	upstream := &fakeUpstream{list: func(ctx context.Context, _ *mcp.ListToolsParams) (*mcp.ListToolsResult, error) {
+		if gate {
+			close(entered)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return listing(names...)(ctx, nil)
+	}}
+	u := prepared(t, Upstream{ClientFactory: upstream.factory(t)})
+	c := newToolCache(u)
+	service := newService(u, c, "call")
+	require.NoError(t, c.refresh(t.Context()))
+
+	names, gate = []string{"b"}, true
+	done := make(chan error, 1)
+	go func() { done <- c.refresh(t.Context()) }()
+	<-entered
+	// A running discovery does not change the published list.
+	require.Contains(t, c.nameToTools, "a")
+	releaseOnce()
+	require.NoError(t, <-done)
+	require.Contains(t, c.nameToTools, "b")
+	require.NotContains(t, c.nameToTools, "a")
+	// The handlers stay the same: list_tools plus the dynamic handler.
+	require.NotNil(t, service.Operation("list_tools"))
+	require.Equal(t, "b", service.Operation("b").Name())
 }

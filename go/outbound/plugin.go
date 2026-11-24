@@ -18,6 +18,7 @@ type plugin struct {
 	// upstreams points to the copies that NewPlugin validated. The handlers
 	// share them and do not change them.
 	upstreams []*Upstream
+	caches    map[string]*toolCache
 }
 
 var _ worker.Plugin = (*plugin)(nil)
@@ -30,7 +31,7 @@ func (p *plugin) StartWorker(ctx context.Context, opts worker.PluginStartWorkerO
 	for _, u := range p.upstreams {
 		activityName := activityName(u.Service)
 		opts.WorkerRegistry.RegisterActivityWithOptions(callToolActivity(u), activity.RegisterOptions{Name: activityName})
-		opts.WorkerRegistry.RegisterNexusService(newService(u, activityName))
+		opts.WorkerRegistry.RegisterNexusService(newService(u, p.caches[u.Service], activityName))
 	}
 	return next(ctx, opts)
 }
