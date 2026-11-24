@@ -12,7 +12,7 @@ smartly typed APIs given an upstream MCP spec.
 
 import asyncio
 import hashlib
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -35,6 +35,7 @@ from temporalio.common import (
     ActivityIDConflictPolicy,
     ActivityIDReusePolicy,
     RawValue,
+    RetryPolicy,
 )
 from temporalio.exceptions import (
     ActivityAlreadyStartedError,
@@ -136,12 +137,13 @@ def service_handler(
                 ) from None
             # This is an async SAA-backed call, where the activity is the HTTP
             # call upstream.
-            return await _start_tool(cache, call, ctx, client, arguments)
+            return await _start_tool(upstream, cache, call, ctx, client, arguments)
 
     return _ProxyService()
 
 
 async def _start_tool(
+    upstream: Upstream,
     cache: ToolCache,
     call: Callable[..., Awaitable[dict[str, Any]]],
     ctx: TemporalStartOperationContext,
@@ -172,7 +174,7 @@ async def _start_tool(
             type=nexusrpc.HandlerErrorType.BAD_REQUEST,
         )
     try:
-        await cache.find_tool(name)
+        tool = await cache.find_tool(name)
     except ToolNotFoundError as err:
         raise nexusrpc.HandlerError(
             str(err), type=nexusrpc.HandlerErrorType.NOT_FOUND
@@ -182,12 +184,9 @@ async def _start_tool(
             str(err), type=nexusrpc.HandlerErrorType.UNAVAILABLE
         ) from None
     activity_id = _activity_id(nexus_info().endpoint, ctx.service, name, ctx.request_id)
-    options: dict[str, Any] = {
-        "id": activity_id,
-        "start_to_close_timeout": _DEFAULT_START_TO_CLOSE_TIMEOUT,
-        "id_conflict_policy": ActivityIDConflictPolicy.USE_EXISTING,
-        "id_reuse_policy": ActivityIDReusePolicy.REJECT_DUPLICATE,
-    }
+    options = _activity_options_for(
+        upstream, name, tool.get("annotations"), activity_id
+    )
     try:
         return await client.start_activity(
             call,
@@ -217,6 +216,40 @@ async def _closed_result(handle: ActivityHandle[Any]) -> TemporalOperationResult
         raise nexusrpc.OperationError(
             message, state=nexusrpc.OperationErrorState.FAILED
         ) from None
+
+
+def _activity_options_for(
+    upstream: Upstream,
+    tool: str,
+    annotations: Mapping[str, Any] | None,
+    activity_id: str,
+) -> dict[str, Any]:
+    """Return the start_activity options of the call with ID activity_id to a tool.
+
+    It starts from the tool override, fills the proxy defaults, and sets the
+    options that the proxy owns. Upstream rejects an override that sets those
+    options.
+
+    The default retry policy depends on the tool annotations. A tool with
+    ``destructiveHint=true``, ``readOnlyHint=false``, and
+    ``idempotentHint=false`` gets one attempt. Other tools use the Temporal
+    default retry policy. A retry policy in the override replaces the default.
+    """
+    options = dict(upstream.activity_options_overrides.get(tool, {}))
+    if options.get("start_to_close_timeout") is None:
+        options["start_to_close_timeout"] = _DEFAULT_START_TO_CLOSE_TIMEOUT
+    annotations = annotations or {}
+    if (
+        options.get("retry_policy") is None
+        and annotations.get("readOnlyHint") is not True
+        and annotations.get("destructiveHint") is True
+        and annotations.get("idempotentHint") is not True
+    ):
+        options["retry_policy"] = RetryPolicy(maximum_attempts=1)
+    options["id"] = activity_id
+    options["id_conflict_policy"] = ActivityIDConflictPolicy.USE_EXISTING
+    options["id_reuse_policy"] = ActivityIDReusePolicy.REJECT_DUPLICATE
+    return options
 
 
 def _activity_id(endpoint: str, service: str, operation: str, request_id: str) -> str:
