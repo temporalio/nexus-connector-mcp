@@ -4,12 +4,14 @@ import temporalio.plugin
 
 from ._config import Options
 from ._nexus_handler import call_tool_activity, service_handler
+from ._tool_cache import ToolCache
 
 
 class MCPProxyPlugin(temporalio.plugin.SimplePlugin):
     """Worker plugin that registers the proxy Nexus services and Activities.
 
-    Factories and hooks must support concurrent calls.
+    Workers that share the plugin share its tool lists. Factories and
+    hooks must support concurrent calls.
     """
 
     def __init__(self, *, options: Options) -> None:
@@ -37,12 +39,14 @@ class MCPProxyPlugin(temporalio.plugin.SimplePlugin):
                 raise NotImplementedError(
                     f"Upstream {u.service!r}: activity_options_overrides is not implemented yet"
                 )
+        self._caches = {u.service: ToolCache(u) for u in upstreams}
         activities = [call_tool_activity(u) for u in upstreams]
+        handlers = [
+            service_handler(u, self._caches[u.service], fn)
+            for u, fn in zip(upstreams, activities, strict=True)
+        ]
         super().__init__(
             "temporalio.nexus_mcp.outbound.MCPProxyPlugin",
             activities=activities,
-            nexus_service_handlers=[
-                service_handler(u, fn)
-                for u, fn in zip(upstreams, activities, strict=True)
-            ],
+            nexus_service_handlers=handlers,
         )

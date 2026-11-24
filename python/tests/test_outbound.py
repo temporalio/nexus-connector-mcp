@@ -36,6 +36,7 @@ from temporalio.nexus_mcp.outbound import (  # pyright: ignore[reportPrivateUsag
     Options,
     Upstream,
     _nexus_handler,
+    _tool_cache,
 )
 from temporalio.testing import ActivityEnvironment
 
@@ -105,6 +106,10 @@ def setup_proxy(
     fake = FakeUpstream()
     upstream = Upstream(service="weather", client_factory=factory(fake), **options)
     return fake, upstream, MCPProxyPlugin(options=Options(upstreams=[upstream]))
+
+
+def tool_cache(plugin: MCPProxyPlugin) -> Any:
+    return plugin._caches["weather"]  # pyright: ignore[reportPrivateUsage]
 
 
 def operation_handler(plugin: MCPProxyPlugin, name: str) -> Any:
@@ -237,7 +242,7 @@ def test_activity_id() -> None:
     multibyte.encode().decode()
 
 
-# Tool list
+# Discovery
 
 
 async def test_list_tools_reads_all_pages_and_keeps_metadata() -> None:
@@ -250,12 +255,25 @@ async def test_list_tools_reads_all_pages_and_keeps_metadata() -> None:
     assert fake.entered == 1
 
 
-async def test_list_tools_calls_the_upstream_each_time() -> None:
+async def test_tool_cache_follows_changes_and_keeps_list_on_failure() -> None:
     fake, _, plugin = setup_proxy()
-    await list_tools(plugin)
+    c = tool_cache(plugin)
+    await c.refresh()
     fake.tools = [Tool(name="c", input_schema={"type": "object"})]
-    assert [t["name"] for t in await list_tools(plugin)] == ["c"]
-    assert fake.entered == 2
+    tools = await c.list_tools()
+    assert [t["name"] for t in tools] == ["c"]
+
+    fake.error = OSError("private-token")
+    tools = await c.list_tools()
+    assert [t["name"] for t in tools] == ["c"]
+    # The backoff skips the next discovery.
+    entered = fake.entered
+    await c.list_tools()
+    assert fake.entered == entered
+    assert (await c.find_tool("c"))["name"] == "c"
+    with pytest.raises(_tool_cache.ToolNotFoundError):
+        await c.find_tool("a")
+    assert fake.entered == entered
 
 
 @pytest.mark.parametrize(
@@ -266,15 +284,20 @@ async def test_list_tools_calls_the_upstream_each_time() -> None:
         [Tool(name="dup", input_schema={}), Tool(name="dup", input_schema={})],
     ],
 )
-async def test_list_tools_rejects_bad_lists(tools: list[Tool]) -> None:
+async def test_tool_cache_rejects_bad_lists_and_keeps_previous(
+    tools: list[Tool],
+) -> None:
     fake, _, plugin = setup_proxy()
+    c = tool_cache(plugin)
+    await c.refresh()
+    previous = c.tools
     fake.tools = tools
-    with pytest.raises(nexusrpc.HandlerError) as err:
-        await list_tools(plugin)
-    assert err.value.type == nexusrpc.HandlerErrorType.UNAVAILABLE
+    with pytest.raises(ValueError):
+        await c.refresh()
+    assert c.tools is previous
 
 
-async def test_list_tools_failure_is_unavailable_and_hides_the_error() -> None:
+async def test_list_tools_without_discovery_is_unavailable() -> None:
     fake, _, plugin = setup_proxy()
     fake.error = OSError("private-token")
     with pytest.raises(nexusrpc.HandlerError) as err:
@@ -284,11 +307,73 @@ async def test_list_tools_failure_is_unavailable_and_hides_the_error() -> None:
     assert err.value.__cause__ is None
 
 
+async def test_tool_cache_with_no_upstream_tools_is_discovered() -> None:
+    fake, _, plugin = setup_proxy()
+    fake.tools = []
+    c = tool_cache(plugin)
+    assert await c.list_tools() == []
+    assert c.tools == {}
+    with pytest.raises(_tool_cache.ToolNotFoundError):
+        await c.find_tool("a")
+
+
+async def test_tool_cache_without_discovery_is_unavailable() -> None:
+    fake, _, plugin = setup_proxy()
+    fake.error = OSError("offline")
+    c = tool_cache(plugin)
+    with pytest.raises(_tool_cache.ToolListUnavailableError):
+        await c.list_tools()
+    with pytest.raises(_tool_cache.ToolListUnavailableError):
+        await c.find_tool("a")
+
+
+async def test_tool_cache_backoff_doubles_and_resets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(
+        "temporalio.nexus_mcp.outbound._tool_cache.time.monotonic", lambda: now[0]
+    )
+    monkeypatch.setattr(
+        "temporalio.nexus_mcp.outbound._tool_cache.random.uniform",
+        lambda low, high: high,
+    )
+    fake, _, plugin = setup_proxy()
+    c = tool_cache(plugin)
+    fake.error = OSError("offline")
+    for delay in [1, 2, 4, 8, 16, 32, 60, 60]:
+        with pytest.raises(OSError):
+            await c.refresh()
+        assert c._backoff == delay
+        await c.refresh()  # During the backoff: no discovery, no error.
+        now[0] += delay
+    fake.error = None
+    await c.refresh()
+    assert c._backoff == 0
+    assert c.tools is not None
+
+
+async def test_worker_starts_without_discovery() -> None:
+    fake, _, plugin = setup_proxy()
+    started = False
+
+    async def run(_: Any) -> None:
+        nonlocal started
+        started = True
+
+    await plugin.run_worker(cast(Any, None), run)
+    assert started
+    # The Worker starts without discovery, so it starts while an upstream is
+    # down.
+    assert fake.entered == 0
+
+
 # Tool calls
 
 
 async def test_new_start_uses_default_options_and_stable_identity() -> None:
     _, _, plugin = setup_proxy()
+    await tool_cache(plugin).refresh()
     client, _ = nexus_client()
     await operation_handler(plugin, "a").start_operation(
         context(), client, Input({"x": 1})
@@ -304,19 +389,53 @@ async def test_new_start_uses_default_options_and_stable_identity() -> None:
     }
 
 
-async def test_tool_call_does_not_read_the_tool_list() -> None:
+async def test_unknown_tool_and_missing_discovery() -> None:
     fake, _, plugin = setup_proxy()
     client, _ = nexus_client()
-    # The upstream does not list this tool. The upstream call fails for it.
-    await operation_handler(plugin, "missing").start_operation(
-        context("missing"), client, Input({})
+    fake.error = OSError("offline")
+    with pytest.raises(nexusrpc.HandlerError) as err:
+        await operation_handler(plugin, "a").start_operation(
+            context(), client, Input({})
+        )
+    assert err.value.type == nexusrpc.HandlerErrorType.UNAVAILABLE
+
+    # A tool call fills an empty cache. A tool that the upstream does not list
+    # is not found.
+    _, _, plugin = setup_proxy()
+    with pytest.raises(nexusrpc.HandlerError) as err:
+        await operation_handler(plugin, "missing").start_operation(
+            context("missing"), client, Input({})
+        )
+    assert err.value.type == nexusrpc.HandlerErrorType.NOT_FOUND
+    client.start_activity.assert_not_called()
+
+
+async def test_cache_hit_makes_no_upstream_call_and_miss_refreshes_once() -> None:
+    fake, _, plugin = setup_proxy()
+    await tool_cache(plugin).refresh()
+    client, _ = nexus_client()
+    await operation_handler(plugin, "a").start_operation(context(), client, Input({}))
+    assert fake.entered == 1
+
+    # A tool that is new upstream is a cache miss, so the call refreshes once.
+    fake.tools.append(Tool(name="c", input_schema={"type": "object"}))
+    await operation_handler(plugin, "c").start_operation(
+        context("c"), client, Input({})
     )
-    assert fake.entered == 0
-    assert client.start_activity.call_args.args[1] == call_tool_input("missing", {})
+    assert fake.entered == 2
+
+
+async def test_tool_call_fills_an_empty_cache() -> None:
+    fake, _, plugin = setup_proxy()
+    client, _ = nexus_client()
+    await operation_handler(plugin, "a").start_operation(context(), client, Input({}))
+    assert fake.entered == 1
+    client.start_activity.assert_called_once()
 
 
 async def test_null_arguments_become_empty_object() -> None:
     _, _, plugin = setup_proxy()
+    await tool_cache(plugin).refresh()
     client, _ = nexus_client()
     await operation_handler(plugin, "b").start_operation(
         context("b"), client, Input(None)
