@@ -4,11 +4,14 @@ go 1.26.0
 
 replace github.com/temporalio/nexus-connector-mcp/go => ../../go
 
+replace go.temporal.io/sdk => github.com/long-nt-tran/sdk-go v0.0.0-20261123195816-25be448445dc
+
 require (
 	github.com/coreos/go-oidc/v3 v3.21.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/temporalio/nexus-connector-mcp/go v0.0.0-00010101000000-000000000000
 	go.temporal.io/sdk v1.51.0
+	golang.org/x/oauth2 v0.36.0
 )
 
 require (
@@ -21,7 +24,7 @@ require (
 	github.com/grpc-ecosystem/go-grpc-middleware/v2 v2.3.2 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.22.0 // indirect
 	github.com/nexus-rpc/nexus-proto-annotations v0.1.0 // indirect
-	github.com/nexus-rpc/sdk-go v0.7.0 // indirect
+	github.com/nexus-rpc/sdk-go v0.8.0 // indirect
 	github.com/robfig/cron v1.2.0 // indirect
 	github.com/segmentio/asm v1.1.3 // indirect
 	github.com/segmentio/encoding v0.5.4 // indirect
@@ -31,7 +34,6 @@ require (
 	go.temporal.io/api v1.64.3 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/net v0.60.0 // indirect
-	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect

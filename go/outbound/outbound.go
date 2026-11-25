@@ -3,19 +3,42 @@
 // [NewPlugin] returns a Worker plugin. The plugin registers one Nexus service
 // per [Upstream]. Each service lists the upstream tools and runs each tool call
 // as a standalone Activity.
+//
+// Each service has two handlers:
+//   - list_tools calls the upstream tools/list directly. It returns the last
+//     successful tool list when discovery fails.
+//   - A dynamic handler takes every other operation. The operation name is the
+//     upstream tool name. It starts a standalone Activity that calls the
+//     upstream tools/call, and returns the Activity as an async Nexus
+//     operation.
 package outbound
 
 import (
 	"context"
 	"errors"
+	"fmt"
+	"maps"
+	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 )
 
+const (
+	listToolsOperation = "list_tools"
+	// reservedPrefix starts names that Temporal reserves.
+	reservedPrefix = "__temporal_"
+)
+
 // ClientFactory connects to an upstream MCP server over HTTP or stdio. The
 // factory owns the transport, destination, and credentials.
+//
+// The proxy calls it once for each discovery and once for each tool call
+// attempt, and closes the session after that call. A stdio factory starts one
+// process for each call. Honor ctx during setup. The session must stay open
+// after the setup context ends.
 type ClientFactory func(context.Context) (*mcp.ClientSession, error)
 
 // FailureClassification sets how a failed upstream call is reported to
@@ -55,7 +78,56 @@ type Options struct {
 
 // NewPlugin validates opts and returns a Worker plugin that registers the
 // proxy Nexus services and Activities.
+//
+// Workers that share the plugin share its tool lists. Hooks and factories
+// must support concurrent calls. Do not change opts while a Worker runs.
 func NewPlugin(opts Options) (worker.Plugin, error) {
-	_ = opts
-	return nil, errors.New("outbound: NewPlugin is not implemented")
+	if len(opts.Upstreams) == 0 {
+		return nil, errors.New("outbound: Options.Upstreams needs at least one Upstream")
+	}
+	p := &plugin{caches: map[string]*toolCache{}}
+	for _, u := range opts.Upstreams {
+		prepared, err := prepareUpstream(u)
+		if err != nil {
+			return nil, err
+		}
+		if p.caches[u.Service] != nil {
+			return nil, fmt.Errorf("outbound: duplicate Upstream service %q", u.Service)
+		}
+		p.upstreams = append(p.upstreams, &prepared)
+		p.caches[u.Service] = newToolCache(&prepared)
+	}
+	return p, nil
+}
+
+// isToolName reports whether name can be an upstream tool name. list_tools
+// and names that start with __temporal_ are reserved.
+func isToolName(name string) bool {
+	return strings.TrimSpace(name) != "" && name != listToolsOperation && !strings.HasPrefix(name, reservedPrefix)
+}
+
+// prepareUpstream validates u and returns a copy that later changes by the
+// caller do not affect.
+func prepareUpstream(u Upstream) (Upstream, error) {
+	if strings.TrimSpace(u.Service) == "" || strings.HasPrefix(u.Service, reservedPrefix) {
+		return u, fmt.Errorf("outbound: Upstream.Service %q must be non-empty and not reserved", u.Service)
+	}
+	if u.ClientFactory == nil {
+		return u, fmt.Errorf("outbound: Upstream %q needs a ClientFactory", u.Service)
+	}
+	u.ActivityOptionsOverrides = maps.Clone(u.ActivityOptionsOverrides)
+	for name, o := range u.ActivityOptionsOverrides {
+		if !isToolName(name) {
+			return u, fmt.Errorf("outbound: Upstream %q: tool name %q in ActivityOptionsOverrides must be non-empty and not reserved", u.Service, name)
+		}
+		if o.ID != "" || o.TaskQueue != "" || o.ActivityIDConflictPolicy != 0 || o.ActivityIDReusePolicy != 0 {
+			return u, fmt.Errorf("outbound: Upstream %q: tool %q: the proxy sets the Activity ID, task queue, and conflict and reuse policies", u.Service, name)
+		}
+		for _, d := range []time.Duration{o.StartToCloseTimeout, o.ScheduleToCloseTimeout, o.ScheduleToStartTimeout, o.HeartbeatTimeout, o.StartDelay} {
+			if d < 0 {
+				return u, fmt.Errorf("outbound: Upstream %q: tool %q: timeouts and start delay must not be negative", u.Service, name)
+			}
+		}
+	}
+	return u, nil
 }
