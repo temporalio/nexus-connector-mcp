@@ -1,9 +1,4 @@
-"""Run calls to upstream MCP servers as Temporal Activities.
-
-:class:`MCPProxyPlugin` registers one Nexus service per :class:`Upstream`.
-Each service lists the upstream tools and runs each tool call as a standalone
-Activity.
-"""
+"""Public configuration types of the outbound proxy."""
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
@@ -12,21 +7,16 @@ from typing import Any
 
 from mcp.client import Client
 
-import temporalio.plugin
-
-__all__ = [
-    "ClientFactory",
-    "FailureClassification",
-    "MCPProxyPlugin",
-    "Options",
-    "Upstream",
-]
-
 ClientFactory = Callable[[], AbstractAsyncContextManager[Client]]
 """Connects to an upstream MCP server over HTTP or stdio.
 
 The factory owns the transport, destination, and credentials.
 """
+
+LIST_TOOLS_OPERATION = "list_tools"
+
+# Names with this prefix are reserved for Temporal.
+_RESERVED_PREFIX = "__temporal_"
 
 
 @dataclass(frozen=True)
@@ -50,12 +40,13 @@ class Upstream:
         service: The Nexus service name for this upstream.
         client_factory: Connects to the upstream.
         activity_options_overrides: Maps an upstream tool name to
-            ``TemporalNexusClient.start_activity`` keyword options for that
+            ``TemporalNexusClient.start_activity`` kwargs options for that
             tool. Omitted keys use the proxy defaults. Connector-owned keys
             are rejected: Activity ID, task queue, conflict and reuse
-            policies, and RPC settings.
+            policies, and RPC settings. Not implemented yet.
         classify_error: Optionally overrides the built-in classification of
-            a failed upstream call. Cancellation skips this hook.
+            a failed upstream call. Cancellation skips this hook. Not
+            implemented yet.
     """
 
     service: str
@@ -66,6 +57,22 @@ class Upstream:
     classify_error: (
         Callable[[BaseException, FailureClassification], FailureClassification] | None
     ) = None
+
+    def __post_init__(self) -> None:
+        """Validate the upstream.
+
+        Raises:
+            ValueError: If the service name is not valid.
+            TypeError: If the client factory is not callable.
+        """
+        if not self.service.strip() or self.service.startswith(_RESERVED_PREFIX):
+            raise ValueError(
+                f"Upstream service {self.service!r} must be non-empty and not reserved"
+            )
+        if not callable(self.client_factory):
+            raise TypeError(
+                f"Upstream {self.service!r}: client_factory must be callable"
+            )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -80,16 +87,13 @@ class Options:
     upstreams: Sequence[Upstream]
 
 
-class MCPProxyPlugin(temporalio.plugin.SimplePlugin):
-    """Worker plugin that registers the proxy Nexus services and Activities."""
+def is_tool_name(name: str) -> bool:
+    """Report whether name can be an upstream tool name.
 
-    def __init__(self, *, options: Options) -> None:
-        """Create the plugin.
-
-        Args:
-            options: The proxy configuration.
-        """
-        super().__init__("temporalio.nexus_mcp.outbound.MCPProxyPlugin")
-        raise NotImplementedError(
-            "temporalio.nexus_mcp.outbound.MCPProxyPlugin is not implemented"
-        )
+    ``list_tools`` and names that start with ``__temporal_`` are reserved.
+    """
+    return (
+        bool(name.strip())
+        and name != LIST_TOOLS_OPERATION
+        and not name.startswith(_RESERVED_PREFIX)
+    )
