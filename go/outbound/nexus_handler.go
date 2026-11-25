@@ -23,7 +23,6 @@ import (
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/converter"
-	"go.temporal.io/sdk/log"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/temporalnexus"
 )
@@ -54,19 +53,20 @@ type listToolsResult struct {
 	Tools []*mcp.Tool `json:"tools"`
 }
 
-// newService returns the Nexus service of an upstream.
+// newService returns the Nexus service of an upstream. Discovery changes the
+// tool cache, not the handlers.
 //
 // TODO(long-nt-tran): investigate smart type inference here based on in/out
 // schemas + past tool calls. This would allow us to provide smartly typed
 // APIs given an upstream MCP spec.
-func newService(u *Upstream, activityName string) *nexus.Service {
+func newService(u *Upstream, c *toolCache, activityName string) *nexus.Service {
 	service := nexus.NewService(u.Service)
 	service.MustRegister(nexus.NewSyncOperation(listToolsOperation,
 		func(ctx context.Context, _ nexus.NoValue, _ nexus.StartOperationOptions) (*listToolsResult, error) {
 			// The Worker logger comes from the client options of the user.
-			tools, err := handleListTools(ctx, temporalnexus.GetLogger(ctx), u)
+			tools, err := c.listTools(ctx, temporalnexus.GetLogger(ctx))
 			if err != nil {
-				return nil, err
+				return nil, nexus.NewHandlerErrorf(nexus.HandlerErrorTypeUnavailable, "%v", err)
 			}
 			return &listToolsResult{Tools: tools}, nil
 		}))
@@ -92,7 +92,7 @@ func newService(u *Upstream, activityName string) *nexus.Service {
 				return temporalnexus.TemporalOperationResult[any]{}, nexus.NewHandlerErrorf(nexus.HandlerErrorTypeBadRequest, "cannot read tool arguments")
 			}
 			// This is an async SAA-backed call, where the activity is the HTTP call upstream.
-			return startTool(ctx, activityName, nc, arguments, opts)
+			return startTool(ctx, c, activityName, nc, arguments, opts)
 		},
 	})
 
@@ -104,30 +104,17 @@ func newService(u *Upstream, activityName string) *nexus.Service {
 	return service
 }
 
-// handleListTools runs discovery for each call. A failure gives an unavailable
-// handler error. The log and the error leave out the cause, because upstream
-// errors can hold credentials and private URLs.
-//
-// TODO(long-nt-tran): cache the last successful tool list, and use it before
-// calling upstream (similar to what MCP SDK does).
-func handleListTools(ctx context.Context, logger log.Logger, u *Upstream) ([]*mcp.Tool, error) {
-	tools, err := listTools(ctx, u)
-	if err != nil {
-		if ctx.Err() == nil {
-			logger.Warn("could not discover upstream MCP tools", "service", u.Service)
-		}
-		return nil, nexus.NewHandlerErrorf(nexus.HandlerErrorTypeUnavailable, "upstream tool list is not available")
-	}
-	return tools, nil
-}
-
 // startTool uses temporalnexus to async-start an SAA for the tool named by the Nexus
 // operation.
 //
 // A retried start uses the same Activity ID. USE_EXISTING attaches it to a
 // running Activity. If the Activity already closed, the start fails with
 // ActivityExecutionAlreadyStarted, and startTool returns the Activity outcome.
-func startTool(ctx context.Context, activityName string, nc temporalnexus.NexusClient, arguments json.RawMessage, opts temporalnexus.StartTemporalOperationOptions) (temporalnexus.TemporalOperationResult[any], error) {
+//
+// The tool must be in the tool cache. A cache miss refreshes the cache once,
+// because the tool can be new upstream, or this Worker has not listed the
+// tools yet. A cache hit makes no upstream call.
+func startTool(ctx context.Context, c *toolCache, activityName string, nc temporalnexus.NexusClient, arguments json.RawMessage, opts temporalnexus.StartTemporalOperationOptions) (temporalnexus.TemporalOperationResult[any], error) {
 	var none temporalnexus.TemporalOperationResult[any]
 	name := nexus.ExtractHandlerInfo(ctx).Operation
 	if !isToolName(name) {
@@ -143,6 +130,14 @@ func startTool(ctx context.Context, activityName string, nc temporalnexus.NexusC
 	}
 	if object == nil {
 		arguments = json.RawMessage(`{}`)
+	}
+
+	_, err := c.findTool(ctx, temporalnexus.GetLogger(ctx), name)
+	switch {
+	case errors.Is(err, errToolNotFound):
+		return none, nexus.NewHandlerErrorf(nexus.HandlerErrorTypeNotFound, "%v", err)
+	case err != nil:
+		return none, nexus.NewHandlerErrorf(nexus.HandlerErrorTypeUnavailable, "%v", err)
 	}
 
 	info := nexus.ExtractHandlerInfo(ctx)
