@@ -138,6 +138,8 @@ identity is `TokenInfo.UserID` from the MCP SDK
 [`auth`](https://pkg.go.dev/github.com/modelcontextprotocol/go-sdk/auth) middleware. Set
 `CallerIdentity` to read the identity from other middleware.
 
+The [OAuth sample](../samples/go/oauth_inbound_connector) serves the connector behind OAuth.
+
 ## Call tools from a Workflow
 
 `NexusMCPClient` calls the tools from Workflow code. See the
