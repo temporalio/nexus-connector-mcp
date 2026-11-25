@@ -6,10 +6,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/url"
+	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/nexus-rpc/sdk-go/nexus"
 	enumspb "go.temporal.io/api/enums/v1"
@@ -33,8 +39,12 @@ const (
 	// maxHeartbeatInterval limits the heartbeat interval of a call Activity
 	// that has a heartbeat timeout.
 	maxHeartbeatInterval = 3 * time.Second
-	// failureUpstream is the failure type of a failed upstream call.
-	failureUpstream = "UpstreamError"
+	// Failure types of the built-in classification.
+	failureAuthentication = "UpstreamAuthenticationError"
+	failureConfiguration  = "ProxyConfigurationError"
+	failureProtocol       = "UpstreamProtocolError"
+	failureConnection     = "UpstreamConnectionError"
+	failureOther          = "UpstreamError"
 )
 
 // listToolsResult is the output of list_tools: an MCP tools/list result with
@@ -219,15 +229,12 @@ func callToolActivity(u *Upstream) func(context.Context, callToolInput) (map[str
 		if errors.Is(err, context.Canceled) || temporal.IsCanceledError(err) {
 			return nil, err
 		}
+		classification := classify(u, err)
 		// The failure holds only the type. Upstream messages, response
 		// bodies, and URLs can hold private data, and Temporal records the
-		// failure. The failure does not retry, because the proxy cannot tell
-		// a passing failure from a lasting one, such as an unknown tool.
-		//
-		// TODO(long-nt-tran): classify failures, so that connection failures
-		// retry.
-		return nil, temporal.NewApplicationErrorWithOptions(failureUpstream, failureUpstream,
-			temporal.ApplicationErrorOptions{NonRetryable: true})
+		// failure.
+		return nil, temporal.NewApplicationErrorWithOptions(classification.Type, classification.Type,
+			temporal.ApplicationErrorOptions{NonRetryable: !classification.Retryable})
 	}
 }
 
@@ -263,4 +270,52 @@ func startHeartbeats(ctx context.Context) (stopFn func()) {
 	})
 	stopFn = func() { cancel(); wg.Wait() }
 	return stopFn
+}
+
+// defaultClassification returns the built-in classification of a failed
+// upstream call.
+//
+// For now, only connection-related failures are retryable.
+func defaultClassification(err error) FailureClassification {
+	var rpcErr *jsonrpc.Error
+	var netErr net.Error
+	var urlErr *url.Error
+	var syntaxErr *json.SyntaxError
+	var typeErr *json.UnmarshalTypeError
+	var execErr *exec.Error
+	switch {
+	case errors.Is(err, os.ErrPermission):
+		return FailureClassification{Type: failureAuthentication}
+	case errors.Is(err, os.ErrNotExist), errors.As(err, &execErr):
+		return FailureClassification{Type: failureConfiguration}
+	case errors.As(err, &rpcErr), errors.As(err, &syntaxErr), errors.As(err, &typeErr), errors.Is(err, errProtocol):
+		return FailureClassification{Type: failureProtocol}
+	case errors.As(err, &urlErr) && !errors.As(urlErr.Err, &netErr):
+		return FailureClassification{Type: failureProtocol}
+	case errors.As(err, &netErr), errors.Is(err, mcp.ErrConnectionClosed), errors.Is(err, io.EOF),
+		errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, context.DeadlineExceeded):
+		// For now, this is the only retryable class of errors (connection-based failures).
+		return FailureClassification{Type: failureConnection, Retryable: true}
+	default:
+		return FailureClassification{Type: failureOther}
+	}
+}
+
+// classify uses a user-provided u.ClassifyError(...) to classify if we can
+// retry this error. If none is provided, we fall back to defaultClassification(...).
+func classify(u *Upstream, err error) (result FailureClassification) {
+	result = defaultClassification(err)
+	if u.ClassifyError == nil {
+		return result
+	}
+	defer func() {
+		if recover() != nil {
+			result = FailureClassification{Type: failureConfiguration}
+		}
+	}()
+	result = u.ClassifyError(err, result)
+	if result.Type == "" {
+		result = FailureClassification{Type: failureConfiguration}
+	}
+	return result
 }

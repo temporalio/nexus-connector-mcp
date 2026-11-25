@@ -64,8 +64,6 @@ type Upstream struct {
 
 	// ClassifyError optionally overrides the built-in classification of a
 	// failed upstream call. Cancellation skips this hook.
-	//
-	// Not implemented yet. NewPlugin rejects a non-nil hook.
 	ClassifyError func(err error, def FailureClassification) FailureClassification
 }
 
@@ -118,9 +116,6 @@ func prepareUpstream(u Upstream) (Upstream, error) {
 	}
 	if len(u.ActivityOptionsOverrides) > 0 {
 		return u, fmt.Errorf("outbound: Upstream %q: ActivityOptionsOverrides is not implemented yet", u.Service)
-	}
-	if u.ClassifyError != nil {
-		return u, fmt.Errorf("outbound: Upstream %q: ClassifyError is not implemented yet", u.Service)
 	}
 	return u, nil
 }
