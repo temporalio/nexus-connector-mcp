@@ -71,6 +71,9 @@ Activity completes. A failed upstream call fails the Activity. See [Failures](#f
 The proxy calls `ClientFactory` once for each discovery and each Activity attempt. The credentials
 stay in the Worker, because the Activity input holds only the tool name and arguments.
 
+The [OAuth sample](../samples/go/oauth_outbound_connector) connects to an upstream that requires
+OAuth.
+
 ### Activity defaults
 
 - Start-to-close timeout: 1 minute.
