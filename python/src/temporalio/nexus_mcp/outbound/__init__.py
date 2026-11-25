@@ -6,7 +6,8 @@ Activity.
 
 Each service has two handlers:
 
-- ``list_tools`` calls the upstream ``tools/list``.
+- ``list_tools`` calls the upstream ``tools/list`` directly. It returns the
+  last successful tool list when discovery fails.
 - A dynamic handler takes every other operation. The operation name is the
   upstream tool name. It starts a standalone Activity that calls the upstream
   ``tools/call``, and returns the Activity as an async Nexus operation.

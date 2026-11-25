@@ -26,7 +26,7 @@ import pydantic
 from mcp.shared.exceptions import MCPError
 from mcp.types import CONNECTION_CLOSED, REQUEST_TIMEOUT
 
-from temporalio import activity, nexus
+from temporalio import activity
 from temporalio.client import (
     ActivityFailureError,
     ActivityHandle,
@@ -55,7 +55,8 @@ from ._config import (
     Upstream,
     is_tool_name,
 )
-from ._mcp_client import ProtocolError, call_tool, list_tools
+from ._mcp_client import ProtocolError, call_tool
+from ._tool_cache import ToolCache, ToolListUnavailableError, ToolNotFoundError
 
 # The proxy default for each Activity attempt.
 _DEFAULT_START_TO_CLOSE_TIMEOUT = timedelta(minutes=1)
@@ -75,9 +76,14 @@ _FAILURE_OTHER = "UpstreamError"
 
 
 def service_handler(
-    upstream: Upstream, call: Callable[..., Awaitable[dict[str, Any]]]
+    upstream: Upstream,
+    cache: ToolCache,
+    call: Callable[..., Awaitable[dict[str, Any]]],
 ) -> object:
-    """Return the Nexus service of an upstream."""
+    """Return the Nexus service of an upstream.
+
+    Discovery changes the tool cache, not the handlers.
+    """
 
     @nexusrpc.handler.service_handler(name=upstream.service)
     class _ProxyService:
@@ -85,7 +91,12 @@ def service_handler(
         async def list_tools(
             self, ctx: nexusrpc.handler.StartOperationContext, input: None
         ) -> dict[str, Any]:
-            return {"tools": await _handle_list_tools(upstream)}
+            try:
+                return {"tools": await cache.list_tools()}
+            except ToolListUnavailableError as err:
+                raise nexusrpc.HandlerError(
+                    str(err), type=nexusrpc.HandlerErrorType.UNAVAILABLE
+                ) from None
 
         # Calling an upstream tool is handled by a dynamic handler, since we
         # don't know the names of the tools provided by an upstream server.
@@ -102,7 +113,7 @@ def service_handler(
         # operation-level granularity provided by Nexus).
         #
         # Cancellation of a tool call uses the default handler, which cancels
-        # the Activity by its operation token.
+        # the Activity by its operation token without a tool lookup.
         @temporal_operation(dynamic=True)
         async def call_tool(
             self,
@@ -125,38 +136,13 @@ def service_handler(
                 ) from None
             # This is an async SAA-backed call, where the activity is the HTTP
             # call upstream.
-            return await _start_tool(call, ctx, client, arguments)
+            return await _start_tool(cache, call, ctx, client, arguments)
 
     return _ProxyService()
 
 
-async def _handle_list_tools(upstream: Upstream) -> list[dict[str, Any]]:
-    """Run discovery for each call.
-
-    A failure gives an unavailable handler error. The log and the error leave
-    out the cause, because upstream errors can hold credentials and private
-    URLs.
-
-    Raises:
-        nexusrpc.HandlerError: If the upstream call fails.
-    """
-    # TODO(long-nt-tran): cache the last successful tool list, and use it before
-    # calling upstream (similar to what MCP SDK does).
-    try:
-        return list((await list_tools(upstream)).values())
-    # Any upstream error makes the tool list unavailable.
-    except Exception:  # noqa: BLE001
-        # The Temporal Nexus logger adds the service and operation to the log.
-        nexus.logger.warning(
-            "Could not discover upstream MCP tools for service %s", upstream.service
-        )
-        raise nexusrpc.HandlerError(
-            "upstream tool list is not available",
-            type=nexusrpc.HandlerErrorType.UNAVAILABLE,
-        ) from None
-
-
 async def _start_tool(
+    cache: ToolCache,
     call: Callable[..., Awaitable[dict[str, Any]]],
     ctx: TemporalStartOperationContext,
     client: TemporalNexusClient,
@@ -167,6 +153,10 @@ async def _start_tool(
     A retried start uses the same Activity ID. USE_EXISTING attaches it to a
     running Activity. If the Activity already closed, the start fails with
     ActivityAlreadyStartedError, and _start_tool returns the Activity outcome.
+
+    The tool must be in the tool cache. A cache miss refreshes the cache once,
+    because the tool can be new upstream, or this Worker has not listed the
+    tools yet. A cache hit makes no upstream call.
     """
     name = ctx.operation
     if not is_tool_name(name):
@@ -181,6 +171,16 @@ async def _start_tool(
             "tool arguments must be a JSON object",
             type=nexusrpc.HandlerErrorType.BAD_REQUEST,
         )
+    try:
+        await cache.find_tool(name)
+    except ToolNotFoundError as err:
+        raise nexusrpc.HandlerError(
+            str(err), type=nexusrpc.HandlerErrorType.NOT_FOUND
+        ) from None
+    except ToolListUnavailableError as err:
+        raise nexusrpc.HandlerError(
+            str(err), type=nexusrpc.HandlerErrorType.UNAVAILABLE
+        ) from None
     activity_id = _activity_id(nexus_info().endpoint, ctx.service, name, ctx.request_id)
     options: dict[str, Any] = {
         "id": activity_id,
