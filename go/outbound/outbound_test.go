@@ -23,6 +23,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/nexus-rpc/sdk-go/nexus"
 	"github.com/stretchr/testify/require"
+	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/log"
@@ -102,6 +103,66 @@ func prepared(t *testing.T, u Upstream) *Upstream {
 	return &result
 }
 
+func TestActivityOptionsDefaultsAndOverrides(t *testing.T) {
+	t.Parallel()
+
+	u := prepared(t, Upstream{})
+	defaults := u.activityOptionsFor("tool", nil, "id")
+	require.Equal(t, "id", defaults.ID)
+	require.Equal(t, enumspb.ACTIVITY_ID_CONFLICT_POLICY_USE_EXISTING, defaults.ActivityIDConflictPolicy)
+	require.Equal(t, enumspb.ACTIVITY_ID_REUSE_POLICY_REJECT_DUPLICATE, defaults.ActivityIDReusePolicy)
+	require.Equal(t, time.Minute, defaults.StartToCloseTimeout)
+	require.Zero(t, defaults.ScheduleToCloseTimeout)
+	require.Zero(t, defaults.HeartbeatTimeout)
+	require.Nil(t, defaults.RetryPolicy)
+	require.Zero(t, defaults.Priority)
+	require.Zero(t, defaults.TypedSearchAttributes.Size())
+
+	// A destructive tool that is not idempotent gets one attempt.
+	annotations := &mcp.ToolAnnotations{DestructiveHint: new(true)}
+	opts := u.activityOptionsFor("tool", annotations, "id")
+	require.EqualValues(t, 1, opts.RetryPolicy.MaximumAttempts)
+	annotations.IdempotentHint = true
+	opts = u.activityOptionsFor("tool", annotations, "id")
+	require.Nil(t, opts.RetryPolicy)
+	annotations.IdempotentHint, annotations.ReadOnlyHint = false, true
+	opts = u.activityOptionsFor("tool", annotations, "id")
+	require.Nil(t, opts.RetryPolicy)
+
+	policy := &temporal.RetryPolicy{MaximumAttempts: 3, NonRetryableErrorTypes: []string{"CustomFailure"}}
+	priority := temporal.Priority{PriorityKey: 2, FairnessKey: "tenant", FairnessWeight: 2}
+	attributes := temporal.NewSearchAttributes(temporal.NewSearchAttributeKeyKeyword("project").ValueSet("weather"))
+	u = prepared(t, Upstream{ActivityOptionsOverrides: map[string]client.StartActivityOptions{
+		"tool": {
+			StartToCloseTimeout:    time.Hour,
+			ScheduleToCloseTimeout: 2 * time.Hour,
+			ScheduleToStartTimeout: 5 * time.Second,
+			HeartbeatTimeout:       30 * time.Second,
+			StartDelay:             time.Second,
+			RetryPolicy:            policy,
+			Priority:               priority,
+			TypedSearchAttributes:  attributes,
+			Summary:                "weather tool",
+			StaticDetails:          "Runs the upstream tool",
+		},
+	}})
+	opts = u.activityOptionsFor("tool", &mcp.ToolAnnotations{DestructiveHint: new(true)}, "id")
+	require.Equal(t, time.Hour, opts.StartToCloseTimeout)
+	require.Equal(t, 2*time.Hour, opts.ScheduleToCloseTimeout)
+	require.Equal(t, 5*time.Second, opts.ScheduleToStartTimeout)
+	require.Equal(t, 30*time.Second, opts.HeartbeatTimeout)
+	require.Equal(t, time.Second, opts.StartDelay)
+	require.Same(t, policy, opts.RetryPolicy)
+	require.Equal(t, priority, opts.Priority)
+	require.Equal(t, 1, opts.TypedSearchAttributes.Size())
+	require.Equal(t, "weather tool", opts.Summary)
+	require.Equal(t, "Runs the upstream tool", opts.StaticDetails)
+
+	// Other tools keep the defaults.
+	other := u.activityOptionsFor("other", nil, "id")
+	require.Equal(t, defaults, other)
+}
+
 func TestNewPluginValidatesOptions(t *testing.T) {
 	t.Parallel()
 
@@ -116,8 +177,10 @@ func TestNewPluginValidatesOptions(t *testing.T) {
 		"empty service":    {Options{Upstreams: []Upstream{{ClientFactory: factory}}}, "non-empty and not reserved"},
 		"reserved service": {Options{Upstreams: []Upstream{{Service: "__temporal_x", ClientFactory: factory}}}, "non-empty and not reserved"},
 		"no factory":       {Options{Upstreams: []Upstream{{Service: "tools"}}}, "needs a ClientFactory"},
-		"overrides": {Options{Upstreams: []Upstream{{Service: "tools", ClientFactory: factory,
-			ActivityOptionsOverrides: map[string]client.StartActivityOptions{"tool": {}}}}}, "not implemented"},
+		"reserved tool": {Options{Upstreams: []Upstream{{Service: "tools", ClientFactory: factory,
+			ActivityOptionsOverrides: map[string]client.StartActivityOptions{"list_tools": {}}}}}, "non-empty and not reserved"},
+		"negative timeout": {Options{Upstreams: []Upstream{{Service: "tools", ClientFactory: factory,
+			ActivityOptionsOverrides: map[string]client.StartActivityOptions{"tool": {HeartbeatTimeout: -time.Second}}}}}, "must not be negative"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -131,6 +194,24 @@ func TestNewPluginValidatesOptions(t *testing.T) {
 	p, err := NewPlugin(Options{Upstreams: []Upstream{valid, {Service: "other", ClientFactory: factory}}})
 	require.NoError(t, err)
 	require.Equal(t, pluginName, p.Name())
+}
+
+func TestConnectorOwnedActivityOptionsAreRejected(t *testing.T) {
+	t.Parallel()
+
+	for _, options := range []client.StartActivityOptions{
+		{ID: "custom-id"},
+		{TaskQueue: "other-queue"},
+		{ActivityIDConflictPolicy: enumspb.ACTIVITY_ID_CONFLICT_POLICY_USE_EXISTING},
+		{ActivityIDReusePolicy: enumspb.ACTIVITY_ID_REUSE_POLICY_REJECT_DUPLICATE},
+	} {
+		_, err := NewPlugin(Options{Upstreams: []Upstream{{
+			Service:                  "tools",
+			ClientFactory:            func(context.Context) (*mcp.ClientSession, error) { return nil, errors.New("unused") },
+			ActivityOptionsOverrides: map[string]client.StartActivityOptions{"tool": options},
+		}}})
+		require.ErrorContains(t, err, "the proxy sets")
+	}
 }
 
 func TestActivityID(t *testing.T) {
@@ -406,10 +487,13 @@ func requireHandlerError(t *testing.T, err error, want nexus.HandlerErrorType) {
 	require.Equal(t, want, handlerErr.Type)
 }
 
-func TestNewStartUsesDefaultOptionsAndStableIdentity(t *testing.T) {
+func TestNewStartUsesOptionsAndStableIdentity(t *testing.T) {
 	t.Parallel()
 
-	_, u := newWeatherUpstream(t)
+	_, weather := newWeatherUpstream(t)
+	u := prepared(t, Upstream{Service: "weather", ClientFactory: weather.ClientFactory, ActivityOptionsOverrides: map[string]client.StartActivityOptions{
+		"a": {ScheduleToCloseTimeout: time.Hour},
+	}})
 	c := newToolCache(u)
 	require.NoError(t, c.refresh(t.Context()))
 	calls, out, err := runToolCall(t, u, c, "a", map[string]any{"x": 1})
@@ -420,6 +504,9 @@ func TestNewStartUsesDefaultOptionsAndStableIdentity(t *testing.T) {
 	require.JSONEq(t, `{"x":1}`, string(calls[0].input.Arguments))
 	require.Regexp(t, "^mcp-outbound-weather-endpoint-weather-a-[0-9a-f-]+$", calls[0].info.ActivityID)
 	require.Equal(t, defaultStartToCloseTimeout, calls[0].info.StartToCloseTimeout)
+	// The test environment does not report the retry policy or priority of
+	// the Activity. TestActivityOptionsDefaultsAndOverrides covers them.
+	require.Equal(t, time.Hour, calls[0].info.ScheduleToCloseTimeout)
 }
 
 func TestUnknownToolAndMissingDiscovery(t *testing.T) {

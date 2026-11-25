@@ -92,7 +92,7 @@ func newService(u *Upstream, c *toolCache, activityName string) *nexus.Service {
 				return temporalnexus.TemporalOperationResult[any]{}, nexus.NewHandlerErrorf(nexus.HandlerErrorTypeBadRequest, "cannot read tool arguments")
 			}
 			// This is an async SAA-backed call, where the activity is the HTTP call upstream.
-			return startTool(ctx, c, activityName, nc, arguments, opts)
+			return startTool(ctx, u, c, activityName, nc, arguments, opts)
 		},
 	})
 
@@ -114,7 +114,7 @@ func newService(u *Upstream, c *toolCache, activityName string) *nexus.Service {
 // The tool must be in the tool cache. A cache miss refreshes the cache once,
 // because the tool can be new upstream, or this Worker has not listed the
 // tools yet. A cache hit makes no upstream call.
-func startTool(ctx context.Context, c *toolCache, activityName string, nc temporalnexus.NexusClient, arguments json.RawMessage, opts temporalnexus.StartTemporalOperationOptions) (temporalnexus.TemporalOperationResult[any], error) {
+func startTool(ctx context.Context, u *Upstream, c *toolCache, activityName string, nc temporalnexus.NexusClient, arguments json.RawMessage, opts temporalnexus.StartTemporalOperationOptions) (temporalnexus.TemporalOperationResult[any], error) {
 	var none temporalnexus.TemporalOperationResult[any]
 	name := nexus.ExtractHandlerInfo(ctx).Operation
 	if !isToolName(name) {
@@ -132,7 +132,7 @@ func startTool(ctx context.Context, c *toolCache, activityName string, nc tempor
 		arguments = json.RawMessage(`{}`)
 	}
 
-	_, err := c.findTool(ctx, temporalnexus.GetLogger(ctx), name)
+	tool, err := c.findTool(ctx, temporalnexus.GetLogger(ctx), name)
 	switch {
 	case errors.Is(err, errToolNotFound):
 		return none, nexus.NewHandlerErrorf(nexus.HandlerErrorTypeNotFound, "%v", err)
@@ -142,12 +142,7 @@ func startTool(ctx context.Context, c *toolCache, activityName string, nc tempor
 
 	info := nexus.ExtractHandlerInfo(ctx)
 	id := activityID(temporalnexus.GetOperationInfo(ctx).Endpoint, info.Service, info.Operation, opts.RequestID)
-	options := client.StartActivityOptions{
-		ID:                       id,
-		StartToCloseTimeout:      defaultStartToCloseTimeout,
-		ActivityIDConflictPolicy: enumspb.ACTIVITY_ID_CONFLICT_POLICY_USE_EXISTING,
-		ActivityIDReusePolicy:    enumspb.ACTIVITY_ID_REUSE_POLICY_REJECT_DUPLICATE,
-	}
+	options := u.activityOptionsFor(name, tool.Annotations, id)
 	result, err := temporalnexus.StartUntypedActivity[any](ctx, nc, options, activityName, callToolInput{Tool: name, Arguments: arguments})
 	if _, ok := errors.AsType[*serviceerror.ActivityExecutionAlreadyStarted](err); ok {
 		// A retried start of an Activity that already closed. Return its
@@ -178,6 +173,30 @@ func closedResult(ctx context.Context, handle client.ActivityHandle) (temporalne
 		return none, nexus.NewOperationFailedErrorf("upstream call failed")
 	}
 	return temporalnexus.NewSyncResult[any](result), nil
+}
+
+// activityOptionsFor returns the Activity options of the call with Activity
+// ID id to tool name. It starts from the tool override, fills the proxy
+// defaults, and sets the fields that the proxy owns. NewPlugin rejects an
+// override that sets those fields.
+//
+// The default retry policy depends on the tool annotations. A tool with
+// destructiveHint=true, readOnlyHint=false, and idempotentHint=false gets one
+// attempt. Other tools use the Temporal default retry policy. A retry policy
+// in the override replaces the default.
+func (u *Upstream) activityOptionsFor(name string, annotations *mcp.ToolAnnotations, id string) client.StartActivityOptions {
+	options := u.ActivityOptionsOverrides[name]
+	if options.StartToCloseTimeout == 0 {
+		options.StartToCloseTimeout = defaultStartToCloseTimeout
+	}
+	if options.RetryPolicy == nil && annotations != nil && !annotations.ReadOnlyHint &&
+		annotations.DestructiveHint != nil && *annotations.DestructiveHint && !annotations.IdempotentHint {
+		options.RetryPolicy = &temporal.RetryPolicy{MaximumAttempts: 1}
+	}
+	options.ID = id
+	options.ActivityIDConflictPolicy = enumspb.ACTIVITY_ID_CONFLICT_POLICY_USE_EXISTING
+	options.ActivityIDReusePolicy = enumspb.ACTIVITY_ID_REUSE_POLICY_REJECT_DUPLICATE
+	return options
 }
 
 // activityID returns "mcp-outbound-{endpoint}-{service}-{operation}-{request_id}".

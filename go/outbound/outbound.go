@@ -17,7 +17,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.temporal.io/sdk/client"
@@ -60,8 +62,6 @@ type Upstream struct {
 	// options for that tool. Zero-valued fields use the proxy defaults.
 	// Connector-owned fields must be zero: Activity ID, task queue,
 	// conflict and reuse policies, and Nexus callbacks.
-	//
-	// Not implemented yet. NewPlugin rejects a non-empty map.
 	ActivityOptionsOverrides map[string]client.StartActivityOptions
 
 	// ClassifyError optionally overrides the built-in classification of a
@@ -115,8 +115,19 @@ func prepareUpstream(u Upstream) (Upstream, error) {
 	if u.ClientFactory == nil {
 		return u, fmt.Errorf("outbound: Upstream %q needs a ClientFactory", u.Service)
 	}
-	if len(u.ActivityOptionsOverrides) > 0 {
-		return u, fmt.Errorf("outbound: Upstream %q: ActivityOptionsOverrides is not implemented yet", u.Service)
+	u.ActivityOptionsOverrides = maps.Clone(u.ActivityOptionsOverrides)
+	for name, o := range u.ActivityOptionsOverrides {
+		if !isToolName(name) {
+			return u, fmt.Errorf("outbound: Upstream %q: tool name %q in ActivityOptionsOverrides must be non-empty and not reserved", u.Service, name)
+		}
+		if o.ID != "" || o.TaskQueue != "" || o.ActivityIDConflictPolicy != 0 || o.ActivityIDReusePolicy != 0 {
+			return u, fmt.Errorf("outbound: Upstream %q: tool %q: the proxy sets the Activity ID, task queue, and conflict and reuse policies", u.Service, name)
+		}
+		for _, d := range []time.Duration{o.StartToCloseTimeout, o.ScheduleToCloseTimeout, o.ScheduleToStartTimeout, o.HeartbeatTimeout, o.StartDelay} {
+			if d < 0 {
+				return u, fmt.Errorf("outbound: Upstream %q: tool %q: timeouts and start delay must not be negative", u.Service, name)
+			}
+		}
 	}
 	return u, nil
 }
