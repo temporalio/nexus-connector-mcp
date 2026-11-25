@@ -5,6 +5,8 @@ python = "3.15"
 uv = "0.13.8"  # Keep in sync with required-version in python/pyproject.toml.
 node = "24"
 pnpm = "10.27.0"  # Keep in sync with packageManager in typescript/package.json.
+# uv builds the temporalio Git source in python/pyproject.toml. Its Rust core needs protoc.
+protoc = "36.2"
 
 [env]
 # The SDK wheel owns the temporalio package. An editable install cannot add

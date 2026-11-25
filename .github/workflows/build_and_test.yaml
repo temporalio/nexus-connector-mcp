@@ -19,7 +19,8 @@ jobs:
   check:
     name: ${{ matrix.language }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # A run without a uv cache builds the temporalio Rust core from source.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -50,7 +51,8 @@ jobs:
   python-min:
     name: python (3.11)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # A run without a uv cache builds the temporalio Rust core from source.
+    timeout-minutes: 45
     env:
       UV_PYTHON: "3.11"
     steps:
