@@ -18,8 +18,13 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import anyio
+import httpx2
 import nexusrpc
 import nexusrpc.handler
+import pydantic
+from mcp.shared.exceptions import MCPError
+from mcp.types import CONNECTION_CLOSED, REQUEST_TIMEOUT
 
 from temporalio import activity, nexus
 from temporalio.client import (
@@ -44,8 +49,13 @@ from temporalio.nexus import (
 )
 from temporalio.nexus import info as nexus_info
 
-from ._config import LIST_TOOLS_OPERATION, Upstream, is_tool_name
-from ._mcp_client import call_tool, list_tools
+from ._config import (
+    LIST_TOOLS_OPERATION,
+    FailureClassification,
+    Upstream,
+    is_tool_name,
+)
+from ._mcp_client import ProtocolError, call_tool, list_tools
 
 # The proxy default for each Activity attempt.
 _DEFAULT_START_TO_CLOSE_TIMEOUT = timedelta(minutes=1)
@@ -56,8 +66,12 @@ _MAX_ACTIVITY_ID_BYTES = 1000
 # Limits the heartbeat interval, in seconds, of a call Activity that has a
 # heartbeat timeout.
 _MAX_HEARTBEAT_INTERVAL = 3.0
-# The failure type of a failed upstream call.
-_FAILURE_UPSTREAM = "UpstreamError"
+# Failure types of the built-in classification.
+_FAILURE_AUTHENTICATION = "UpstreamAuthenticationError"
+_FAILURE_CONFIGURATION = "ProxyConfigurationError"
+_FAILURE_PROTOCOL = "UpstreamProtocolError"
+_FAILURE_CONNECTION = "UpstreamConnectionError"
+_FAILURE_OTHER = "UpstreamError"
 
 
 def service_handler(
@@ -259,15 +273,14 @@ def call_tool_activity(upstream: Upstream) -> Callable[..., Awaitable[dict[str, 
             # Cancellation skips classification.
             if not isinstance(leaf, Exception) or is_cancelled_exception(leaf):
                 raise leaf from None
+            classification = _classify(upstream, leaf)
             # The failure holds only the type. Upstream messages, response
             # bodies, and URLs can hold private data, and Temporal records the
-            # failure. The failure does not retry, because the proxy cannot tell
-            # a passing failure from a lasting one, such as an unknown tool.
-            #
-            # TODO(long-nt-tran): classify failures, so that connection failures
-            # retry.
+            # failure.
             raise ApplicationError(
-                _FAILURE_UPSTREAM, type=_FAILURE_UPSTREAM, non_retryable=True
+                classification.type,
+                type=classification.type,
+                non_retryable=not classification.retryable,
             ) from None
 
     return call_upstream_tool
@@ -320,8 +333,8 @@ def _remaining_time() -> float | None:
 def _first_leaf(err: BaseException) -> BaseException:
     """Return the first exception in an exception group.
 
-    A cancellation in the group comes first, so it is not reported as an
-    upstream failure.
+    A cancellation in the group comes first, so it does not become a
+    retryable upstream failure.
     """
     if isinstance(err, BaseExceptionGroup):
         leaves = [_first_leaf(child) for child in err.exceptions]  # pyright: ignore[reportUnknownVariableType, reportUnknownMemberType]
@@ -330,3 +343,66 @@ def _first_leaf(err: BaseException) -> BaseException:
                 return leaf
         return leaves[0]
     return err
+
+
+def _default_classification(err: BaseException) -> FailureClassification:
+    """Return the built-in classification of a failed upstream call.
+
+    For now, only connection-related failures are retryable.
+    """
+    if isinstance(err, MCPError):
+        if err.error.code in (CONNECTION_CLOSED, REQUEST_TIMEOUT):
+            return FailureClassification(_FAILURE_CONNECTION, True)
+        return FailureClassification(_FAILURE_PROTOCOL, False)
+    if isinstance(err, httpx2.HTTPStatusError):
+        status = err.response.status_code
+        if status in (401, 403):
+            return FailureClassification(_FAILURE_AUTHENTICATION, False)
+        # TODO(long-nt-tran): retry HTTP 429, 408, and 5xx responses, and use
+        # the Retry-After header as the next retry delay.
+        return FailureClassification(_FAILURE_OTHER, False)
+    if isinstance(err, PermissionError):
+        return FailureClassification(_FAILURE_AUTHENTICATION, False)
+    if isinstance(err, (FileNotFoundError, NotADirectoryError, IsADirectoryError)):
+        return FailureClassification(_FAILURE_CONFIGURATION, False)
+    if isinstance(
+        err, (ProtocolError, pydantic.ValidationError, ValueError, TypeError)
+    ):
+        return FailureClassification(_FAILURE_PROTOCOL, False)
+    if isinstance(
+        err,
+        (
+            ConnectionError,
+            TimeoutError,
+            OSError,
+            httpx2.TransportError,
+            anyio.EndOfStream,
+            anyio.BrokenResourceError,
+            anyio.ClosedResourceError,
+        ),
+    ):
+        # For now, this is the only retryable class of errors (connection-based
+        # failures).
+        return FailureClassification(_FAILURE_CONNECTION, True)
+    return FailureClassification(_FAILURE_OTHER, False)
+
+
+def _classify(upstream: Upstream, err: Exception) -> FailureClassification:
+    """Classify a failed upstream call.
+
+    Use a user-provided upstream.classify_error(...) to classify if we can
+    retry this error. If none is provided, fall back to
+    _default_classification(...).
+    """
+    classification = _default_classification(err)
+    if upstream.classify_error is None:
+        return classification
+    try:
+        result = upstream.classify_error(err, classification)
+    # classify_error is user code. Any error it raises is a configuration
+    # failure.
+    except Exception:  # noqa: BLE001
+        return FailureClassification(_FAILURE_CONFIGURATION, False)
+    if not isinstance(result, FailureClassification) or not result.type:  # pyright: ignore[reportUnnecessaryIsInstance]
+        return FailureClassification(_FAILURE_CONFIGURATION, False)
+    return result

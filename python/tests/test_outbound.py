@@ -15,6 +15,7 @@ import pytest
 from mcp.client import Client
 from mcp.shared.exceptions import MCPError
 from mcp.types import (
+    CONNECTION_CLOSED,
     INVALID_PARAMS,
     CallToolResult,
     ImageContent,
@@ -220,18 +221,8 @@ def test_plugin_validates_options() -> None:
 
 
 def test_options_that_are_not_implemented_are_rejected() -> None:
-    def classify(
-        err: BaseException, default: FailureClassification
-    ) -> FailureClassification:
-        return default
-
-    not_implemented: list[dict[str, Any]] = [
-        {"activity_options_overrides": {"a": {}}},
-        {"classify_error": classify},
-    ]
-    for options in not_implemented:
-        with pytest.raises(NotImplementedError, match="not implemented yet"):
-            setup_proxy(**options)
+    with pytest.raises(NotImplementedError, match="not implemented yet"):
+        setup_proxy(activity_options_overrides={"a": {}})
 
 
 def test_activity_id() -> None:
@@ -397,22 +388,54 @@ async def test_activity_sends_empty_content_array() -> None:
 
 
 @pytest.mark.parametrize(
-    "failure",
+    ("failure", "failure_type", "retryable"),
     [
-        PermissionError("private-token"),
-        MCPError(INVALID_PARAMS, "private"),
-        httpx2.ConnectError("private"),
-        ExceptionGroup("group", [OSError("private")]),
-        RuntimeError("private"),
+        (PermissionError("private-token"), "UpstreamAuthenticationError", False),
+        (FileNotFoundError("private-path"), "ProxyConfigurationError", False),
+        (MCPError(CONNECTION_CLOSED, "private"), "UpstreamConnectionError", True),
+        (MCPError(INVALID_PARAMS, "private"), "UpstreamProtocolError", False),
+        (ConnectionResetError("private"), "UpstreamConnectionError", True),
+        (httpx2.ConnectError("private"), "UpstreamConnectionError", True),
+        (
+            ExceptionGroup("group", [OSError("private")]),
+            "UpstreamConnectionError",
+            True,
+        ),
+        (RuntimeError("private"), "UpstreamError", False),
     ],
 )
-async def test_activity_failures_hold_only_the_type(failure: Exception) -> None:
+async def test_activity_failures_hold_only_the_type(
+    failure: Exception, failure_type: str, retryable: bool
+) -> None:
     fake, _, plugin = setup_proxy()
     fake.error = failure
     with pytest.raises(ApplicationError) as err:
         await activity_env().run(call_fn(plugin), call_tool_input())
-    assert err.value.type == "UpstreamError"
+    assert err.value.type == failure_type
+    assert err.value.non_retryable is not retryable
+    assert "private" not in str(err.value)
+
+
+@pytest.mark.parametrize(
+    ("status", "failure_type"),
+    [
+        (401, "UpstreamAuthenticationError"),
+        (403, "UpstreamAuthenticationError"),
+        (429, "UpstreamError"),
+        (503, "UpstreamError"),
+        (400, "UpstreamError"),
+    ],
+)
+async def test_http_status_classification(status: int, failure_type: str) -> None:
+    request = httpx2.Request("POST", "https://upstream.example.com/mcp?token=private")
+    response = httpx2.Response(status, headers={"Retry-After": "120"}, request=request)
+    fake, _, plugin = setup_proxy()
+    fake.error = httpx2.HTTPStatusError("private", request=request, response=response)
+    with pytest.raises(ApplicationError) as err:
+        await activity_env().run(call_fn(plugin), call_tool_input())
+    assert err.value.type == failure_type
     assert err.value.non_retryable
+    assert err.value.next_retry_delay is None
     assert "private" not in str(err.value)
 
 
@@ -423,15 +446,52 @@ async def test_activity_rejects_incomplete_results() -> None:
     )
     with pytest.raises(ApplicationError) as err:
         await activity_env().run(call_fn(plugin), call_tool_input())
-    assert err.value.type == "UpstreamError"
+    assert err.value.type == "UpstreamProtocolError"
     assert err.value.non_retryable
 
 
-async def test_activity_cancellation_is_raised() -> None:
-    fake, _, plugin = setup_proxy()
+async def test_classify_error_hook() -> None:
+    def classify(
+        err: BaseException, default: FailureClassification
+    ) -> FailureClassification:
+        assert default.type == "UpstreamError"
+        return FailureClassification("CustomFailure", True)
+
+    fake, _, plugin = setup_proxy(classify_error=classify)
+    fake.error = RuntimeError("private")
+    with pytest.raises(ApplicationError) as err:
+        await activity_env().run(call_fn(plugin), call_tool_input())
+    assert err.value.type == "CustomFailure"
+    assert not err.value.non_retryable
+
+    def broken(
+        err: BaseException, default: FailureClassification
+    ) -> FailureClassification:
+        raise RuntimeError("private-hook-value")
+
+    fake, _, plugin = setup_proxy(classify_error=broken)
+    fake.error = RuntimeError("private")
+    with pytest.raises(ApplicationError) as err:
+        await activity_env().run(call_fn(plugin), call_tool_input())
+    assert err.value.type == "ProxyConfigurationError"
+    assert err.value.non_retryable
+    assert "private" not in str(err.value)
+
+
+async def test_cancellation_skips_classification() -> None:
+    called: list[bool] = []
+
+    def classify(
+        err: BaseException, default: FailureClassification
+    ) -> FailureClassification:
+        called.append(True)
+        return default
+
+    fake, _, plugin = setup_proxy(classify_error=classify)
     fake.error = asyncio.CancelledError()
     with pytest.raises(asyncio.CancelledError):
         await activity_env().run(call_fn(plugin), call_tool_input())
+    assert not called
 
 
 async def test_activity_deadline_stops_the_upstream_call() -> None:
@@ -447,7 +507,7 @@ async def test_activity_deadline_stops_the_upstream_call() -> None:
     env = activity_env(start_to_close_timeout=timedelta(milliseconds=50))
     with pytest.raises(ApplicationError) as err:
         await env.run(call_fn(plugin), call_tool_input())
-    assert err.value.type == "UpstreamError"
+    assert err.value.type == "UpstreamConnectionError"
 
 
 async def test_heartbeats_when_heartbeat_timeout_is_set() -> None:
