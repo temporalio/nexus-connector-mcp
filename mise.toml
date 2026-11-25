@@ -41,7 +41,12 @@ depends = ["deps:*"]
 [tasks."lint:go"]
 description = "Lint Go files"
 dir = "go"
-run = ["golangci-lint run ./...", "golangci-lint fmt --diff ./..."]
+run = [
+  "golangci-lint run ./...",
+  "golangci-lint fmt --diff ./...",
+  "cd ../samples/go && golangci-lint run -c ../../go/.golangci.yaml ./...",
+  "cd ../samples/go && golangci-lint fmt -c ../../go/.golangci.yaml --diff ./...",
+]
 
 [tasks."lint:python"]
 description = "Lint and type-check Python files"
@@ -117,7 +122,7 @@ depends = ["test:*"]
 [tasks."build:go"]
 description = "Build Go packages"
 dir = "go"
-run = "go build ./..."
+run = ["go build ./...", "cd ../samples/go && go build -o /dev/null ./..."]
 
 [tasks."build:python"]
 description = "Build the Python sdist and wheel into python/dist"
