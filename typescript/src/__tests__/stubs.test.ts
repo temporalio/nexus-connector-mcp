@@ -2,7 +2,6 @@ import test from 'ava';
 import * as nexus from 'nexus-rpc';
 import * as z from 'zod';
 import { service, serviceHandler, tool } from '../index.js';
-import { NexusMCPClient } from '../workflow.js';
 
 const exampleService = nexus.service('example', {
   greet: nexus.operation<{ name: string }, string>(),
@@ -29,10 +28,4 @@ test('tool is not implemented', (t) => {
       }),
     { message: /not implemented/ },
   );
-});
-
-test('NexusMCPClient is not implemented', (t) => {
-  t.throws(() => new NexusMCPClient({ service: 'example', endpoint: 'example-endpoint' }), {
-    message: /not implemented/,
-  });
 });

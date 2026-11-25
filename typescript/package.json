@@ -38,6 +38,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
+    "@temporalio/workflow": "^1.24.0",
     "nexus-rpc": "^0.0.3",
     "zod": "^4.1.0"
   },
