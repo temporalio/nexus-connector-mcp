@@ -48,7 +48,7 @@
     "ava": "^5.3.1",
     "eslint": "^9.26.0",
     "eslint-config-prettier": "^10.1.8",
-    "eslint-import-resolver-typescript": "^3.6.1",
+    "eslint-import-resolver-typescript": "^4.4.5",
     "eslint-plugin-import": "^2.31.0",
     "prettier": "^3.10.0",
     "typescript": "^5.9.3",
