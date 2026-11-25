@@ -18,6 +18,7 @@ classifiers = [
 ]
 dependencies = [
   "temporalio>=1.36.0,<2",
+  "nexus-rpc>=1.6.0,<2",
   "mcp>=2,<3",
 ]
 
@@ -49,11 +50,16 @@ dev = [
 default-groups = ["dev"]
 required-version = ">=0.13.0,<0.14"  # Keep in sync with the uv pin in the root mise.toml.
 exclude-newer = "2 weeks"  # Supply-chain cooldown for third-party packages.
-exclude-newer-package = { temporalio = false }  # First-party SDK releases are usable on release day.
+exclude-newer-package = { temporalio = false, nexus-rpc = false }  # First-party SDK releases are usable on release day.
 # UV_NO_EDITABLE=1 is set in the root mise.toml. An editable install cannot add a
 # subpackage to the SDK-owned temporalio package, so uv installs this project as a
 # wheel. uv rebuilds the wheel when these files change.
 cache-keys = [{ file = "pyproject.toml" }, { file = "README.md" }, { file = "src/**/*" }]
+
+# The outbound proxy needs dynamic Nexus operation handlers, which are not in a
+# released SDK yet. Building temporalio from source needs Rust and protoc.
+[tool.uv.sources]
+temporalio = { git = "https://github.com/temporalio/sdk-python.git", rev = "2e5c20c5b985e5e6dde19cd3cc2153e8cf6ac1ec" }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
