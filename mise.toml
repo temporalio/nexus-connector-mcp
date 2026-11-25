@@ -55,6 +55,10 @@ run = [
   "uv run --locked mypy",
   "uv run --locked basedpyright --project basedpyrightconfig.json",
   "uv run --locked pydocstyle src",
+  "cd ../samples/python && uv run --project ../../python --locked ruff check --config ../../python/pyproject.toml .",
+  "cd ../samples/python && uv run --project ../../python --locked ruff format --check --config ../../python/pyproject.toml .",
+  "cd ../samples/python/oauth_outbound_connector && uv run --project ../../../python --locked pyright .",
+  "cd ../samples/python/oauth_outbound_connector && uv run --project ../../../python --locked mypy .",
 ]
 
 [tasks."lint:typescript"]
@@ -78,7 +82,12 @@ run = ["go fix ./...", "golangci-lint fmt ./..."]
 [tasks."format:python"]
 description = "Format Python files"
 dir = "python"
-run = ["uv run --locked ruff check --select I --fix", "uv run --locked ruff format"]
+run = [
+  "uv run --locked ruff check --select I --fix",
+  "uv run --locked ruff format",
+  "cd ../samples/python && uv run --project ../../python --locked ruff check --config ../../python/pyproject.toml --select I --fix .",
+  "cd ../samples/python && uv run --project ../../python --locked ruff format --config ../../python/pyproject.toml .",
+]
 
 [tasks."format:typescript"]
 description = "Format TypeScript files"
