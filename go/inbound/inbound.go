@@ -97,5 +97,5 @@ func NewServer(opts Options) (*mcp.Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("inbound: %w", err)
 	}
-	return newServer(&connector{opts: &opts, nexus: nexus}), nil
+	return newServer(&connector{opts: &opts, nexus: nexus})
 }
