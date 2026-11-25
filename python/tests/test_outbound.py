@@ -1,0 +1,762 @@
+"""Tests for temporalio.nexus_mcp.outbound."""
+
+import asyncio
+import dataclasses
+from collections.abc import Awaitable, Callable
+from contextlib import AbstractAsyncContextManager
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock
+
+import httpx2
+import nexusrpc
+import pytest
+from mcp.client import Client
+from mcp.shared.exceptions import MCPError
+from mcp.types import (
+    CONNECTION_CLOSED,
+    INVALID_PARAMS,
+    CallToolResult,
+    ImageContent,
+    ListToolsResult,
+    TextContent,
+    Tool,
+    ToolAnnotations,
+)
+from nexusrpc.handler._core import ServiceHandler  # pyright: ignore[reportPrivateUsage]
+
+from temporalio.common import (
+    ActivityIDConflictPolicy,
+    ActivityIDReusePolicy,
+    Priority,
+    RawValue,
+    RetryPolicy,
+)
+from temporalio.converter import DataConverter
+from temporalio.exceptions import ActivityAlreadyStartedError, ApplicationError
+from temporalio.nexus import TemporalOperationResult, TemporalStartOperationContext
+from temporalio.nexus_mcp.outbound import (  # pyright: ignore[reportPrivateUsage]
+    FailureClassification,
+    MCPProxyPlugin,
+    Options,
+    Upstream,
+    _nexus_handler,
+    _tool_cache,
+)
+from temporalio.testing import ActivityEnvironment
+
+
+class FakeUpstream:
+    """An MCP client double. tools/list returns two pages."""
+
+    def __init__(self) -> None:
+        self.tools = [
+            Tool(
+                name="a",
+                input_schema={"type": "object"},
+                output_schema={
+                    "type": "object",
+                    "properties": {"message": {"type": "string"}},
+                },
+                annotations=ToolAnnotations(destructive_hint=True),
+                _meta={"source": "upstream"},
+            ),
+            Tool(name="b", input_schema={"type": "object"}),
+        ]
+        self.result = CallToolResult(content=[TextContent(type="text", text="ok")])
+        self.error: BaseException | None = None
+        self.calls: list[tuple[str, dict[str, Any] | None]] = []
+        self.entered = 0
+
+    async def list_tools(
+        self, *, cursor: str | None = None, cache_mode: str = "use"
+    ) -> ListToolsResult:
+        assert cache_mode == "bypass"
+        if self.error:
+            raise self.error
+        if cursor is None:
+            return ListToolsResult(tools=self.tools[:1], next_cursor="page-2")
+        return ListToolsResult(tools=self.tools[1:])
+
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any] | None = None
+    ) -> CallToolResult:
+        self.calls.append((name, arguments))
+        if self.error:
+            raise self.error
+        return self.result
+
+
+class _Session(AbstractAsyncContextManager[Client]):
+    """Enters the fake upstream as an MCP client."""
+
+    def __init__(self, fake: FakeUpstream) -> None:
+        self.fake = fake
+
+    async def __aenter__(self) -> Client:
+        self.fake.entered += 1
+        return cast(Client, cast(object, self.fake))
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+
+def factory(fake: FakeUpstream) -> Callable[[], AbstractAsyncContextManager[Client]]:
+    return lambda: _Session(fake)
+
+
+def setup_proxy(
+    **options: Any,
+) -> tuple[FakeUpstream, Upstream, MCPProxyPlugin]:
+    fake = FakeUpstream()
+    upstream = Upstream(service="weather", client_factory=factory(fake), **options)
+    return fake, upstream, MCPProxyPlugin(options=Options(upstreams=[upstream]))
+
+
+def tool_cache(plugin: MCPProxyPlugin) -> Any:
+    return plugin._caches["weather"]  # pyright: ignore[reportPrivateUsage]
+
+
+def operation_handler(plugin: MCPProxyPlugin, name: str) -> Any:
+    handlers = cast(list[object], plugin.nexus_service_handlers)
+    return ServiceHandler.from_user_instance(handlers[0]).get_operation_handler(name)
+
+
+def context(operation: str = "a") -> TemporalStartOperationContext:
+    return TemporalStartOperationContext(
+        service="weather",
+        operation=operation,
+        request_id="r1",
+        headers={},
+        task_cancellation=MagicMock(),
+    )
+
+
+async def list_tools(plugin: MCPProxyPlugin) -> list[dict[str, Any]]:
+    """Run the list_tools operation of the plugin service and return the tools.
+
+    It calls the operation handler directly, so the tests need no Worker and no
+    Temporal server.
+    """
+    handler = operation_handler(plugin, "list_tools")
+    result = await handler.start(context("list_tools"), None)
+    # The result has only the tools. MCP SDKs reject an empty cacheScope.
+    assert list(result.value) == ["tools"]
+    return result.value["tools"]
+
+
+class Input:
+    """A LazyValue double. The dynamic handler consumes it as a RawValue."""
+
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+    async def consume(self, as_type: type | None = None) -> object:
+        assert as_type is RawValue
+        return RawValue(DataConverter.default.payload_converter.to_payload(self.value))
+
+
+def nexus_client() -> tuple[Any, Any]:
+    """Return a TemporalNexusClient double and its Activity handle."""
+    handle = SimpleNamespace(result=AsyncMock(return_value="earlier result"))
+    client = SimpleNamespace(
+        client=SimpleNamespace(
+            get_activity_handle=MagicMock(return_value=handle),
+            data_converter=DataConverter.default,
+        ),
+        start_activity=AsyncMock(
+            return_value=TemporalOperationResult[Any].async_token("token")
+        ),
+    )
+    return client, handle
+
+
+@pytest.fixture(autouse=True)
+def nexus_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "temporalio.nexus_mcp.outbound._nexus_handler.nexus_info",
+        lambda: SimpleNamespace(endpoint="weather-endpoint"),
+    )
+
+
+def activity_env(**info: Any) -> ActivityEnvironment:
+    env = ActivityEnvironment()
+    now = datetime.now(UTC)
+    env.info = dataclasses.replace(
+        env.info, started_time=now, scheduled_time=now, **info
+    )
+    return env
+
+
+def call_fn(plugin: MCPProxyPlugin) -> Callable[..., Awaitable[dict[str, Any]]]:
+    activities = cast(list[Callable[..., Awaitable[dict[str, Any]]]], plugin.activities)
+    return activities[0]
+
+
+def call_tool_input(tool: str = "a", arguments: dict[str, Any] | None = None) -> Any:
+    return _nexus_handler._CallToolInput(tool=tool, arguments=arguments or {})  # pyright: ignore[reportPrivateUsage]
+
+
+# Configuration
+
+
+def test_plugin_validates_options() -> None:
+    fake = FakeUpstream()
+    with pytest.raises(ValueError, match="at least one Upstream"):
+        MCPProxyPlugin(options=Options(upstreams=[]))
+    upstream = Upstream(service="weather", client_factory=factory(fake))
+    with pytest.raises(ValueError, match="Duplicate Upstream service 'weather'"):
+        MCPProxyPlugin(options=Options(upstreams=[upstream, upstream]))
+    for service in ["", " ", "__temporal_x"]:
+        with pytest.raises(ValueError, match="not reserved"):
+            Upstream(service=service, client_factory=factory(fake))
+    with pytest.raises(TypeError, match="callable"):
+        Upstream(service="weather", client_factory=cast(Any, None))
+    with pytest.raises(ValueError, match="not reserved"):
+        Upstream(
+            service="weather",
+            client_factory=factory(fake),
+            activity_options_overrides={"list_tools": {}},
+        )
+    with pytest.raises(ValueError, match="must not be negative"):
+        Upstream(
+            service="weather",
+            client_factory=factory(fake),
+            activity_options_overrides={
+                "a": {"heartbeat_timeout": timedelta(seconds=-1)}
+            },
+        )
+
+    plugin = MCPProxyPlugin(
+        options=Options(
+            upstreams=[
+                upstream,
+                Upstream(service="other", client_factory=factory(fake)),
+            ]
+        )
+    )
+    assert plugin.name() == "temporalio.nexus_mcp.outbound.MCPProxyPlugin"
+    assert len(cast(list[object], plugin.nexus_service_handlers)) == 2
+    activities = cast(list[Any], plugin.activities)
+    assert [fn.__temporal_activity_definition.name for fn in activities] == [
+        "mcp-outbound.weather.call_upstream_tool",
+        "mcp-outbound.other.call_upstream_tool",
+    ]
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "id",
+        "task_queue",
+        "id_conflict_policy",
+        "id_reuse_policy",
+        "rpc_metadata",
+        "rpc_timeout",
+        "result_type",
+    ],
+)
+def test_connector_owned_options_are_rejected(key: str) -> None:
+    with pytest.raises(TypeError, match="the proxy sets"):
+        Upstream(
+            service="weather",
+            client_factory=factory(FakeUpstream()),
+            activity_options_overrides={"a": {key: None}},
+        )
+
+
+def test_overrides_are_copied() -> None:
+    overrides: dict[str, dict[str, Any]] = {"a": {"summary": "first"}}
+    _, upstream, _ = setup_proxy(activity_options_overrides=overrides)
+    overrides["a"]["summary"] = "changed"
+    assert upstream.activity_options_overrides["a"]["summary"] == "first"
+
+
+def test_activity_options_defaults_and_overrides() -> None:
+    _, upstream, _ = setup_proxy(
+        activity_options_overrides={
+            "a": {
+                "start_to_close_timeout": timedelta(hours=1),
+                "heartbeat_timeout": timedelta(seconds=30),
+                "retry_policy": RetryPolicy(maximum_attempts=5),
+                "priority": Priority(priority_key=2),
+                "summary": "weather",
+            }
+        }
+    )
+    options_for = _nexus_handler._activity_options_for  # pyright: ignore[reportPrivateUsage]
+    assert options_for(upstream, "b", None, "id") == {
+        "start_to_close_timeout": timedelta(minutes=1),
+        "id": "id",
+        "id_conflict_policy": ActivityIDConflictPolicy.USE_EXISTING,
+        "id_reuse_policy": ActivityIDReusePolicy.REJECT_DUPLICATE,
+    }
+    options = options_for(upstream, "a", {"destructiveHint": True}, "id")
+    assert options["start_to_close_timeout"] == timedelta(hours=1)
+    assert options["heartbeat_timeout"] == timedelta(seconds=30)
+    assert options["retry_policy"].maximum_attempts == 5
+    assert options["priority"].priority_key == 2
+    assert options["summary"] == "weather"
+
+
+def test_none_override_uses_defaults() -> None:
+    _, upstream, _ = setup_proxy(
+        activity_options_overrides={
+            "a": {"start_to_close_timeout": None, "retry_policy": None}
+        }
+    )
+    options = _nexus_handler._activity_options_for(  # pyright: ignore[reportPrivateUsage]
+        upstream, "a", {"destructiveHint": True}, "id"
+    )
+    assert options["start_to_close_timeout"] == timedelta(minutes=1)
+    assert options["retry_policy"].maximum_attempts == 1
+
+
+@pytest.mark.parametrize(
+    ("annotations", "attempts"),
+    [
+        ({"destructiveHint": True}, 1),
+        ({"destructiveHint": True, "idempotentHint": True}, None),
+        ({"destructiveHint": True, "readOnlyHint": True}, None),
+        ({}, None),
+        (None, None),
+    ],
+)
+def test_annotations_select_retry_policy(
+    annotations: dict[str, Any] | None, attempts: int | None
+) -> None:
+    _, upstream, _ = setup_proxy()
+    options = _nexus_handler._activity_options_for(upstream, "a", annotations, "id")  # pyright: ignore[reportPrivateUsage]
+    policy = options.get("retry_policy")
+    assert (policy.maximum_attempts if policy else None) == attempts
+
+
+def test_activity_id() -> None:
+    activity_id = _nexus_handler._activity_id  # pyright: ignore[reportPrivateUsage]
+    assert activity_id("ep", "svc", "tool", "req") == "mcp-outbound-ep-svc-tool-req"
+    long = activity_id("ep", "svc", "tool", "x" * 2000)
+    assert len(long.encode()) <= 1000
+    assert long.startswith("mcp-outbound-ep-svc-tool-x")
+    assert long != activity_id("ep", "svc", "tool", "x" * 2001)
+    multibyte = activity_id("ep", "svc", "tool", "é" * 600)
+    assert len(multibyte.encode()) <= 1000
+    multibyte.encode().decode()
+
+
+# Discovery
+
+
+async def test_list_tools_reads_all_pages_and_keeps_metadata() -> None:
+    fake, _, plugin = setup_proxy()
+    tools = await list_tools(plugin)
+    assert [t["name"] for t in tools] == ["a", "b"]
+    assert tools[0]["annotations"] == {"destructiveHint": True}
+    assert tools[0]["_meta"] == {"source": "upstream"}
+    assert tools[0]["outputSchema"]["type"] == "object"
+    assert fake.entered == 1
+
+
+async def test_tool_cache_follows_changes_and_keeps_list_on_failure() -> None:
+    fake, _, plugin = setup_proxy()
+    c = tool_cache(plugin)
+    await c.refresh()
+    fake.tools = [Tool(name="c", input_schema={"type": "object"})]
+    tools = await c.list_tools()
+    assert [t["name"] for t in tools] == ["c"]
+
+    fake.error = OSError("private-token")
+    tools = await c.list_tools()
+    assert [t["name"] for t in tools] == ["c"]
+    # The backoff skips the next discovery.
+    entered = fake.entered
+    await c.list_tools()
+    assert fake.entered == entered
+    assert (await c.find_tool("c"))["name"] == "c"
+    with pytest.raises(_tool_cache.ToolNotFoundError):
+        await c.find_tool("a")
+    assert fake.entered == entered
+
+
+@pytest.mark.parametrize(
+    "tools",
+    [
+        [Tool(name="list_tools", input_schema={})],
+        [Tool(name="__temporal_x", input_schema={})],
+        [Tool(name="dup", input_schema={}), Tool(name="dup", input_schema={})],
+    ],
+)
+async def test_tool_cache_rejects_bad_lists_and_keeps_previous(
+    tools: list[Tool],
+) -> None:
+    fake, _, plugin = setup_proxy()
+    c = tool_cache(plugin)
+    await c.refresh()
+    previous = c.tools
+    fake.tools = tools
+    with pytest.raises(ValueError):
+        await c.refresh()
+    assert c.tools is previous
+
+
+async def test_list_tools_without_discovery_is_unavailable() -> None:
+    fake, _, plugin = setup_proxy()
+    fake.error = OSError("private-token")
+    with pytest.raises(nexusrpc.HandlerError) as err:
+        await list_tools(plugin)
+    assert err.value.type == nexusrpc.HandlerErrorType.UNAVAILABLE
+    assert "private" not in str(err.value)
+    assert err.value.__cause__ is None
+
+
+async def test_tool_cache_with_no_upstream_tools_is_discovered() -> None:
+    fake, _, plugin = setup_proxy()
+    fake.tools = []
+    c = tool_cache(plugin)
+    assert await c.list_tools() == []
+    assert c.tools == {}
+    with pytest.raises(_tool_cache.ToolNotFoundError):
+        await c.find_tool("a")
+
+
+async def test_tool_cache_without_discovery_is_unavailable() -> None:
+    fake, _, plugin = setup_proxy()
+    fake.error = OSError("offline")
+    c = tool_cache(plugin)
+    with pytest.raises(_tool_cache.ToolListUnavailableError):
+        await c.list_tools()
+    with pytest.raises(_tool_cache.ToolListUnavailableError):
+        await c.find_tool("a")
+
+
+async def test_tool_cache_backoff_doubles_and_resets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(
+        "temporalio.nexus_mcp.outbound._tool_cache.time.monotonic", lambda: now[0]
+    )
+    monkeypatch.setattr(
+        "temporalio.nexus_mcp.outbound._tool_cache.random.uniform",
+        lambda low, high: high,
+    )
+    fake, _, plugin = setup_proxy()
+    c = tool_cache(plugin)
+    fake.error = OSError("offline")
+    for delay in [1, 2, 4, 8, 16, 32, 60, 60]:
+        with pytest.raises(OSError):
+            await c.refresh()
+        assert c._backoff == delay
+        await c.refresh()  # During the backoff: no discovery, no error.
+        now[0] += delay
+    fake.error = None
+    await c.refresh()
+    assert c._backoff == 0
+    assert c.tools is not None
+
+
+async def test_worker_starts_without_discovery() -> None:
+    fake, _, plugin = setup_proxy()
+    started = False
+
+    async def run(_: Any) -> None:
+        nonlocal started
+        started = True
+
+    await plugin.run_worker(cast(Any, None), run)
+    assert started
+    # The Worker starts without discovery, so it starts while an upstream is
+    # down.
+    assert fake.entered == 0
+
+
+# Tool calls
+
+
+async def test_new_start_uses_options_and_stable_identity() -> None:
+    _, _, plugin = setup_proxy(
+        activity_options_overrides={
+            "a": {
+                "priority": Priority(priority_key=2),
+                "start_delay": timedelta(seconds=1),
+            }
+        }
+    )
+    await tool_cache(plugin).refresh()
+    client, _ = nexus_client()
+    await operation_handler(plugin, "a").start_operation(
+        context(), client, Input({"x": 1})
+    )
+    args, kwargs = client.start_activity.call_args
+    assert args[0] is call_fn(plugin)
+    assert args[1] == call_tool_input("a", {"x": 1})
+    assert kwargs["id"] == "mcp-outbound-weather-endpoint-weather-a-r1"
+    assert kwargs["id_conflict_policy"] == ActivityIDConflictPolicy.USE_EXISTING
+    assert kwargs["id_reuse_policy"] == ActivityIDReusePolicy.REJECT_DUPLICATE
+    assert kwargs["start_to_close_timeout"] == timedelta(minutes=1)
+    assert kwargs["retry_policy"].maximum_attempts == 1  # destructiveHint
+    assert kwargs["priority"].priority_key == 2
+    assert kwargs["start_delay"] == timedelta(seconds=1)
+
+
+async def test_unknown_tool_and_missing_discovery() -> None:
+    fake, _, plugin = setup_proxy()
+    client, _ = nexus_client()
+    fake.error = OSError("offline")
+    with pytest.raises(nexusrpc.HandlerError) as err:
+        await operation_handler(plugin, "a").start_operation(
+            context(), client, Input({})
+        )
+    assert err.value.type == nexusrpc.HandlerErrorType.UNAVAILABLE
+
+    # A tool call fills an empty cache. A tool that the upstream does not list
+    # is not found.
+    _, _, plugin = setup_proxy()
+    with pytest.raises(nexusrpc.HandlerError) as err:
+        await operation_handler(plugin, "missing").start_operation(
+            context("missing"), client, Input({})
+        )
+    assert err.value.type == nexusrpc.HandlerErrorType.NOT_FOUND
+    client.start_activity.assert_not_called()
+
+
+async def test_cache_hit_makes_no_upstream_call_and_miss_refreshes_once() -> None:
+    fake, _, plugin = setup_proxy()
+    await tool_cache(plugin).refresh()
+    client, _ = nexus_client()
+    await operation_handler(plugin, "a").start_operation(context(), client, Input({}))
+    assert fake.entered == 1
+
+    # A tool that is new upstream is a cache miss, so the call refreshes once.
+    fake.tools.append(Tool(name="c", input_schema={"type": "object"}))
+    await operation_handler(plugin, "c").start_operation(
+        context("c"), client, Input({})
+    )
+    assert fake.entered == 2
+
+
+async def test_tool_call_fills_an_empty_cache() -> None:
+    fake, _, plugin = setup_proxy()
+    client, _ = nexus_client()
+    await operation_handler(plugin, "a").start_operation(context(), client, Input({}))
+    assert fake.entered == 1
+    client.start_activity.assert_called_once()
+
+
+async def test_null_arguments_become_empty_object() -> None:
+    _, _, plugin = setup_proxy()
+    await tool_cache(plugin).refresh()
+    client, _ = nexus_client()
+    await operation_handler(plugin, "b").start_operation(
+        context("b"), client, Input(None)
+    )
+    assert client.start_activity.call_args.args[1] == call_tool_input("b", {})
+
+
+@pytest.mark.parametrize("value", [[], [1], "text", 7, False])
+async def test_non_object_arguments_are_bad_requests(value: object) -> None:
+    _, _, plugin = setup_proxy()
+    client, _ = nexus_client()
+    with pytest.raises(nexusrpc.HandlerError) as err:
+        await operation_handler(plugin, "a").start_operation(
+            context(), client, Input(value)
+        )
+    assert err.value.type == nexusrpc.HandlerErrorType.BAD_REQUEST
+    client.start_activity.assert_not_called()
+
+
+@pytest.mark.parametrize("name", ["", "__temporal_internal"])
+async def test_invalid_tool_names_are_not_found(name: str) -> None:
+    _, _, plugin = setup_proxy()
+    client, _ = nexus_client()
+    with pytest.raises(nexusrpc.HandlerError) as err:
+        await operation_handler(plugin, name).start_operation(
+            context(name), client, Input({})
+        )
+    assert err.value.type == nexusrpc.HandlerErrorType.NOT_FOUND
+    client.start_activity.assert_not_called()
+
+
+async def test_retried_start_of_closed_activity_returns_its_result() -> None:
+    _, _, plugin = setup_proxy()
+    client, handle = nexus_client()
+    client.start_activity.side_effect = ActivityAlreadyStartedError("closed", "call")
+    result = await operation_handler(plugin, "a").start_operation(
+        context(), client, Input({})
+    )
+    assert result.value == "earlier result"
+    handle.result.assert_awaited_once()
+
+
+# Call Activity
+
+
+async def test_activity_returns_full_result_in_envelope() -> None:
+    fake, _, plugin = setup_proxy()
+    fake.result = CallToolResult(
+        content=[
+            TextContent(type="text", text="detail"),
+            ImageContent(type="image", data="", mime_type="image/png"),
+        ],
+        structured_content={"x": 1},
+        is_error=True,
+    )
+    result = await activity_env().run(call_fn(plugin), call_tool_input("a", {"x": 1}))
+    payload = result["io.temporal/mcpCallToolResult"]
+    assert payload["isError"] is True
+    assert payload["structuredContent"] == {"x": 1}
+    assert [c["type"] for c in payload["content"]] == ["text", "image"]
+    assert fake.calls == [("a", {"x": 1})]
+
+
+async def test_activity_sends_empty_content_array() -> None:
+    fake, _, plugin = setup_proxy()
+    fake.result = CallToolResult(content=[])
+    result = await activity_env().run(call_fn(plugin), call_tool_input())
+    assert result["io.temporal/mcpCallToolResult"]["content"] == []
+
+
+@pytest.mark.parametrize(
+    ("failure", "failure_type", "retryable"),
+    [
+        (PermissionError("private-token"), "UpstreamAuthenticationError", False),
+        (FileNotFoundError("private-path"), "ProxyConfigurationError", False),
+        (MCPError(CONNECTION_CLOSED, "private"), "UpstreamConnectionError", True),
+        (MCPError(INVALID_PARAMS, "private"), "UpstreamProtocolError", False),
+        (ConnectionResetError("private"), "UpstreamConnectionError", True),
+        (httpx2.ConnectError("private"), "UpstreamConnectionError", True),
+        (
+            ExceptionGroup("group", [OSError("private")]),
+            "UpstreamConnectionError",
+            True,
+        ),
+        (RuntimeError("private"), "UpstreamError", False),
+    ],
+)
+async def test_activity_failures_hold_only_the_type(
+    failure: Exception, failure_type: str, retryable: bool
+) -> None:
+    fake, _, plugin = setup_proxy()
+    fake.error = failure
+    with pytest.raises(ApplicationError) as err:
+        await activity_env().run(call_fn(plugin), call_tool_input())
+    assert err.value.type == failure_type
+    assert err.value.non_retryable is not retryable
+    assert "private" not in str(err.value)
+
+
+@pytest.mark.parametrize(
+    ("status", "failure_type"),
+    [
+        (401, "UpstreamAuthenticationError"),
+        (403, "UpstreamAuthenticationError"),
+        (429, "UpstreamError"),
+        (503, "UpstreamError"),
+        (400, "UpstreamError"),
+    ],
+)
+async def test_http_status_classification(status: int, failure_type: str) -> None:
+    request = httpx2.Request("POST", "https://upstream.example.com/mcp?token=private")
+    response = httpx2.Response(status, headers={"Retry-After": "120"}, request=request)
+    fake, _, plugin = setup_proxy()
+    fake.error = httpx2.HTTPStatusError("private", request=request, response=response)
+    with pytest.raises(ApplicationError) as err:
+        await activity_env().run(call_fn(plugin), call_tool_input())
+    assert err.value.type == failure_type
+    assert err.value.non_retryable
+    assert err.value.next_retry_delay is None
+    assert "private" not in str(err.value)
+
+
+async def test_activity_rejects_incomplete_results() -> None:
+    fake, _, plugin = setup_proxy()
+    fake.result = CallToolResult.model_validate(
+        {"content": [], "resultType": "input_required"}
+    )
+    with pytest.raises(ApplicationError) as err:
+        await activity_env().run(call_fn(plugin), call_tool_input())
+    assert err.value.type == "UpstreamProtocolError"
+    assert err.value.non_retryable
+
+
+async def test_classify_error_hook() -> None:
+    def classify(
+        err: BaseException, default: FailureClassification
+    ) -> FailureClassification:
+        assert default.type == "UpstreamError"
+        return FailureClassification("CustomFailure", True)
+
+    fake, _, plugin = setup_proxy(classify_error=classify)
+    fake.error = RuntimeError("private")
+    with pytest.raises(ApplicationError) as err:
+        await activity_env().run(call_fn(plugin), call_tool_input())
+    assert err.value.type == "CustomFailure"
+    assert not err.value.non_retryable
+
+    def broken(
+        err: BaseException, default: FailureClassification
+    ) -> FailureClassification:
+        raise RuntimeError("private-hook-value")
+
+    fake, _, plugin = setup_proxy(classify_error=broken)
+    fake.error = RuntimeError("private")
+    with pytest.raises(ApplicationError) as err:
+        await activity_env().run(call_fn(plugin), call_tool_input())
+    assert err.value.type == "ProxyConfigurationError"
+    assert err.value.non_retryable
+    assert "private" not in str(err.value)
+
+
+async def test_cancellation_skips_classification() -> None:
+    called: list[bool] = []
+
+    def classify(
+        err: BaseException, default: FailureClassification
+    ) -> FailureClassification:
+        called.append(True)
+        return default
+
+    fake, _, plugin = setup_proxy(classify_error=classify)
+    fake.error = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await activity_env().run(call_fn(plugin), call_tool_input())
+    assert not called
+
+
+async def test_activity_deadline_stops_the_upstream_call() -> None:
+    fake, _, plugin = setup_proxy()
+
+    async def slow_call(
+        name: str, arguments: dict[str, Any] | None = None
+    ) -> CallToolResult:
+        await asyncio.sleep(60)
+        return fake.result
+
+    fake.call_tool = slow_call  # type: ignore[method-assign]
+    env = activity_env(start_to_close_timeout=timedelta(milliseconds=50))
+    with pytest.raises(ApplicationError) as err:
+        await env.run(call_fn(plugin), call_tool_input())
+    assert err.value.type == "UpstreamConnectionError"
+
+
+async def test_heartbeats_when_heartbeat_timeout_is_set() -> None:
+    fake, _, plugin = setup_proxy()
+
+    async def slow_call(
+        name: str, arguments: dict[str, Any] | None = None
+    ) -> CallToolResult:
+        await asyncio.sleep(0.1)
+        return fake.result
+
+    fake.call_tool = slow_call  # type: ignore[method-assign]
+    beats: list[object] = []
+    env = activity_env(heartbeat_timeout=timedelta(milliseconds=30))
+    env.on_heartbeat = lambda *details: beats.append(details)
+    await env.run(call_fn(plugin), call_tool_input())
+    assert len(beats) >= 2
+
+    beats.clear()
+    env = activity_env()
+    env.on_heartbeat = lambda *details: beats.append(details)
+    await env.run(call_fn(plugin), call_tool_input())
+    assert beats == []

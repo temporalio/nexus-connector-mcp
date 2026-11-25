@@ -38,11 +38,13 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
+    "@temporalio/workflow": "^1.24.0",
     "nexus-rpc": "^0.0.3",
     "zod": "^4.1.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.26.0",
+    "@temporalio/nexus": "^1.26.0",
     "@tsconfig/node22": "^22.0.2",
     "@types/node": "^22.18.0",
     "ava": "^8.4.0",

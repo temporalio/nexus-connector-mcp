@@ -3,12 +3,12 @@
 [![Build and test](https://github.com/temporalio/nexus-connector-mcp/actions/workflows/build_and_test.yaml/badge.svg?branch=main)](https://github.com/temporalio/nexus-connector-mcp/actions/workflows/build_and_test.yaml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-This repo will host the building block for an MCP client to connect
-to MCP servers with Temporal Nexus acting as the durable transport under the hood. Specifically:
+Connect MCP clients and servers through Temporal Nexus.
 
-- **Inbound:** serves Nexus operations as MCP tools to any MCP client, allowing MCP clients to reach any Nexus service over MCP.
-- **Outbound:** acts as a durable proxy to upstream MCP servers, by backing tool calls with Nexus and Standalone Activities.
-- **Authoring:** provides building blocks to mark Nexus operations as MCP tools.
+- **Inbound:** serve Nexus operations as MCP tools to any MCP client.
+- **Outbound:** proxy upstream MCP servers. Tool calls run as Nexus operations backed by Standalone
+  Activities.
+- **Authoring:** mark Nexus operations as MCP tools.
 - **Workflow client:** call Nexus-backed MCP tools from Workflow code.
 
 > [!NOTE]
@@ -16,14 +16,32 @@ to MCP servers with Temporal Nexus acting as the durable transport under the hoo
 
 ## Packages
 
-| Directory | Package | Contents |
+| Language | Package | Docs |
 | --- | --- | --- |
-| [`go/`](go) | `github.com/temporalio/nexus-connector-mcp/go` | Inbound connector, Authoring helpers, Workflow client, upstream MCP proxy Worker plugin. |
-| [`python/`](python) | `temporalio-nexus-mcp` (`temporalio.nexus_mcp`) | Authoring helpers, Workflow client, upstream MCP proxy Worker plugin. |
-| [`typescript/`](typescript) | `@temporalio/nexus-mcp` | Authoring helpers, Workflow client. |
+| Go | `github.com/temporalio/nexus-connector-mcp/go` | [go/README.md](go/README.md) |
+| Python | `temporalio-nexus-mcp` | [python/README.md](python/README.md) |
+| TypeScript | `@temporalio/nexus-mcp` | [typescript/README.md](typescript/README.md) |
 
-AI SDK bindings for in-workflow MCP clients to reach a Nexus-backed MCP server will live in [temporalio/ai-integrations](https://github.com/temporalio/ai-integrations).
+## How it works
+
+```mermaid
+flowchart LR
+    Client[MCP client] -->|tools/call| Connector[Inbound connector]
+    Workflow[Workflow] -->|NexusMCPClient| Temporal
+    Connector -->|Nexus operation| Temporal
+    Temporal -->|operation = tool| Handler[Nexus service with MCP tools]
+```
+
+- A Nexus service marks its operations as MCP tools. It also gets a `list_tools` operation.
+- The tool name is the Nexus operation name. The tool schemas come from the operation types.
+- MCP clients reach the tools through the inbound connector. Workflows reach them through
+  `NexusMCPClient`.
+- Temporal runs each tool call as a durable Nexus operation.
 
 ## Development
 
 See [CONTRIBUTING.md](.github/CONTRIBUTING.md).
+
+## License
+
+[MIT](LICENSE)

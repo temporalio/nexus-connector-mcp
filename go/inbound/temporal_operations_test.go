@@ -26,7 +26,7 @@ func TestWaitSeparatesReadErrorsFromOperationFailures(t *testing.T) {
 	} {
 		fake := newFakeClient()
 		fake.readError = test.err
-		out, err := wait(t.Context(), &fakeHandle{parent: fake, operation: "lookup"})
+		out, err := wait(t.Context(), &fakeHandle{parent: fake, operation: "lookup"}, 0)
 		if test.failure {
 			require.NoError(t, err)
 			require.ErrorIs(t, out.failure, test.err)
@@ -55,7 +55,7 @@ func (h *pollDeadlineHandle) Get(_ context.Context, out any) error {
 func TestWaitReadsAgainAfterRPCDeadline(t *testing.T) {
 	t.Parallel()
 
-	out, err := wait(t.Context(), &pollDeadlineHandle{})
+	out, err := wait(t.Context(), &pollDeadlineHandle{}, 0)
 	require.NoError(t, err)
 	require.JSONEq(t, `"done"`, string(out.value))
 }
