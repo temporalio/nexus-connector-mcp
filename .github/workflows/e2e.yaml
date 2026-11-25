@@ -1,0 +1,51 @@
+name: E2E tests
+
+on:
+  # Run on pull requests into any branch, so stacked pull requests also run CI.
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+# A new push to a PR branch cancels the previous run for that branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    # A run without a uv cache builds the temporalio Rust core from source.
+    timeout-minutes: 45
+    env:
+      E2E_LOG_DIR: ${{ github.workspace }}/e2e-logs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The e2e tests run every language against each other.
+      - uses: ./.github/actions/setup
+        with:
+          language: go
+      - uses: ./.github/actions/setup
+        with:
+          language: python
+      - uses: ./.github/actions/setup
+        with:
+          language: typescript
+      # testsuite.StartDevServer downloads the Temporal CLI into the temp
+      # directory. The version is DevServerVersion in e2e_tests/harness.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/temporal-cli-*
+          key: ${{ runner.os }}-temporal-cli-${{ hashFiles('e2e_tests/harness/env.go') }}
+      - run: mise run e2e
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-logs
+          path: e2e-logs
