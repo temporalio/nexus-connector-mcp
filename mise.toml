@@ -48,6 +48,8 @@ run = [
   "golangci-lint fmt --diff ./...",
   "cd ../samples/go && golangci-lint run -c ../../go/.golangci.yaml ./...",
   "cd ../samples/go && golangci-lint fmt -c ../../go/.golangci.yaml --diff ./...",
+  "cd ../e2e_tests && golangci-lint run -c ../go/.golangci.yaml --build-tags e2e ./...",
+  "cd ../e2e_tests && golangci-lint fmt -c ../go/.golangci.yaml --diff ./...",
 ]
 
 [tasks."lint:python"]
@@ -64,6 +66,10 @@ run = [
   "cd ../samples/python && uv run --project ../../python --locked ruff format --check --config ../../python/pyproject.toml .",
   "cd ../samples/python/oauth_outbound_connector && uv run --project ../../../python --locked pyright .",
   "cd ../samples/python/oauth_outbound_connector && uv run --project ../../../python --locked mypy .",
+  "cd ../e2e_tests/fixtures/python && uv run --project ../../../python --locked ruff check --config ../../../python/pyproject.toml .",
+  "cd ../e2e_tests/fixtures/python && uv run --project ../../../python --locked ruff format --check --config ../../../python/pyproject.toml .",
+  "cd ../e2e_tests/fixtures/python && uv run --project ../../../python --locked pyright .",
+  "cd ../e2e_tests/fixtures/python && uv run --project ../../../python --locked mypy .",
 ]
 
 [tasks."lint:typescript"]
@@ -82,7 +88,11 @@ depends = ["lint:*"]
 [tasks."format:go"]
 description = "Format Go files"
 dir = "go"
-run = ["go fix ./...", "golangci-lint fmt ./..."]
+run = [
+  "go fix ./...",
+  "golangci-lint fmt ./...",
+  "cd ../e2e_tests && golangci-lint fmt -c ../go/.golangci.yaml ./...",
+]
 
 [tasks."format:python"]
 description = "Format Python files"
@@ -92,6 +102,8 @@ run = [
   "uv run --locked ruff format",
   "cd ../samples/python && uv run --project ../../python --locked ruff check --config ../../python/pyproject.toml --select I --fix .",
   "cd ../samples/python && uv run --project ../../python --locked ruff format --config ../../python/pyproject.toml .",
+  "cd ../e2e_tests/fixtures/python && uv run --project ../../../python --locked ruff check --config ../../../python/pyproject.toml --select I --fix .",
+  "cd ../e2e_tests/fixtures/python && uv run --project ../../../python --locked ruff format --config ../../../python/pyproject.toml .",
 ]
 
 [tasks."format:typescript"]
@@ -148,3 +160,16 @@ run = ["pnpm run build", "pnpm run pack"]
 [tasks.build]
 description = "Build all languages"
 depends = ["build:*"]
+
+[tasks.e2e]
+description = "Run the e2e tests against a Temporal dev server"
+depends = ["deps:python", "deps:typescript"]
+run = [
+  # The fixtures install the built TypeScript package from typescript/.
+  "pnpm --dir typescript run build",
+  "pnpm --dir e2e_tests/fixtures/typescript install --frozen-lockfile",
+  "pnpm --dir e2e_tests/fixtures/typescript run build",
+  # -count=1 skips the test cache, which does not track the fixtures in other
+  # languages or the dev server.
+  "cd e2e_tests && go test -tags e2e -race -count=1 -timeout 15m ./...",
+]

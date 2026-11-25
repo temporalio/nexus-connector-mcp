@@ -1,0 +1,26 @@
+{
+  "name": "nexus-mcp-e2e-fixtures",
+  "private": true,
+  "description": "TypeScript fixtures for the e2e tests",
+  "scripts": {
+    "build": "tsc --build"
+  },
+  "dependencies": {
+    "@temporalio/client": "1.26.0",
+    "@temporalio/nexus": "1.26.0",
+    "@temporalio/nexus-mcp": "file:../../../typescript",
+    "@temporalio/worker": "1.26.0",
+    "@temporalio/workflow": "1.26.0",
+    "nexus-rpc": "0.0.3",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@tsconfig/node22": "22.0.6",
+    "@types/node": "22.20.5",
+    "typescript": "6.0.3"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "packageManager": "pnpm@10.27.0"
+}
