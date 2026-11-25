@@ -3,12 +3,15 @@ package outbound
 import (
 	"context"
 
+	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/worker"
 )
 
-const pluginName = "nexus-connector-mcp.outbound"
+const (
+	pluginName = "nexus-connector-mcp.outbound"
+)
 
-// plugin registers one Nexus service per upstream.
+// plugin registers one Nexus service and one call Activity per upstream.
 type plugin struct {
 	worker.PluginBase
 
@@ -21,10 +24,13 @@ var _ worker.Plugin = (*plugin)(nil)
 
 func (*plugin) Name() string { return pluginName }
 
-// StartWorker registers the Nexus service of each upstream.
+// StartWorker registers the call Activity and the Nexus service of each
+// upstream.
 func (p *plugin) StartWorker(ctx context.Context, opts worker.PluginStartWorkerOptions, next func(context.Context, worker.PluginStartWorkerOptions) error) error {
 	for _, u := range p.upstreams {
-		opts.WorkerRegistry.RegisterNexusService(newService(u))
+		activityName := activityName(u.Service)
+		opts.WorkerRegistry.RegisterActivityWithOptions(callToolActivity(u), activity.RegisterOptions{Name: activityName})
+		opts.WorkerRegistry.RegisterNexusService(newService(u, activityName))
 	}
 	return next(ctx, opts)
 }

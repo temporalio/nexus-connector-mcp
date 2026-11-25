@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/modelcontextprotocol/go-sdk v1.8.0
-	github.com/nexus-rpc/sdk-go v0.7.0
+	github.com/nexus-rpc/sdk-go v0.8.0
 	github.com/stretchr/testify v1.12.1
 	go.temporal.io/api v1.64.3
 	go.temporal.io/sdk v1.51.0
@@ -36,3 +36,5 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260817212433-ac3dfec99bb1 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
+
+replace go.temporal.io/sdk => github.com/long-nt-tran/sdk-go v0.0.0-20261123195816-25be448445dc

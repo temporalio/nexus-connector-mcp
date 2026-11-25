@@ -2,10 +2,18 @@ package outbound
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+const (
+	// resultEnvelopeKey marks an operation result that is already an MCP
+	// tool result. The inbound connector and the Workflow client keep its
+	// content, _meta, and isError.
+	resultEnvelopeKey = "io.temporal/mcpCallToolResult"
 )
 
 // listTools reads all tool-list pages of the upstream. It returns an
@@ -49,4 +57,50 @@ func listTools(ctx context.Context, u *Upstream) ([]*mcp.Tool, error) {
 		return nil, err
 	}
 	return tools, nil
+}
+
+// errProtocol reports an upstream result that the proxy cannot use.
+var errProtocol = errors.New("invalid or incomplete upstream MCP result")
+
+// callTool opens a session, calls the tool, and closes the session. The
+// Activity context sets the deadline of the connection and the call.
+func callTool(ctx context.Context, u *Upstream, tool string, arguments json.RawMessage) (map[string]json.RawMessage, error) {
+	session, err := u.ClientFactory(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if session == nil {
+		return nil, errProtocol
+	}
+	defer func() { _ = session.Close() }()
+	if len(arguments) == 0 {
+		arguments = json.RawMessage(`{}`)
+	}
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: tool, Arguments: arguments})
+	if err != nil {
+		return nil, err
+	}
+	// The proxy does not support upstream tasks or input requests yet, so it
+	// rejects them. It does not treat them as a complete tool result.
+	if result == nil || result.NeedsInput() {
+		return nil, errProtocol
+	}
+	// The SDK decodes an empty content array as nil. Clients that require an
+	// array reject null, so send an empty array.
+	if result.Content == nil {
+		complete := *result
+		complete.Content = []mcp.Content{}
+		result = &complete
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return nil, errProtocol
+	}
+	var state struct {
+		ResultType string `json:"resultType"`
+	}
+	if err := json.Unmarshal(encoded, &state); err != nil || (state.ResultType != "" && state.ResultType != "complete") {
+		return nil, errProtocol
+	}
+	return map[string]json.RawMessage{resultEnvelopeKey: encoded}, nil
 }
