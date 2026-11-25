@@ -3,6 +3,7 @@
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 
 from mcp.client import Client
@@ -17,6 +18,23 @@ LIST_TOOLS_OPERATION = "list_tools"
 
 # Names with this prefix are reserved for Temporal.
 _RESERVED_PREFIX = "__temporal_"
+
+# start_activity keyword options that an override can set. The proxy sets the
+# Activity ID, task queue, conflict and reuse policies, result type, and RPC
+# settings.
+_ALLOWED_ACTIVITY_OPTIONS = frozenset(
+    {
+        "start_to_close_timeout",
+        "schedule_to_close_timeout",
+        "schedule_to_start_timeout",
+        "heartbeat_timeout",
+        "start_delay",
+        "retry_policy",
+        "priority",
+        "search_attributes",
+        "summary",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -41,9 +59,9 @@ class Upstream:
         client_factory: Connects to the upstream.
         activity_options_overrides: Maps an upstream tool name to
             ``TemporalNexusClient.start_activity`` kwargs options for that
-            tool. Omitted keys use the proxy defaults. Connector-owned keys
+            tool. Omitted or None keys use the proxy defaults. Connector-owned keys
             are rejected: Activity ID, task queue, conflict and reuse
-            policies, and RPC settings. Not implemented yet.
+            policies, and RPC settings.
         classify_error: Optionally overrides the built-in classification of
             a failed upstream call. Cancellation skips this hook.
     """
@@ -58,11 +76,13 @@ class Upstream:
     ) = None
 
     def __post_init__(self) -> None:
-        """Validate the upstream.
+        """Validate the upstream and copy the overrides.
 
         Raises:
-            ValueError: If the service name is not valid.
-            TypeError: If the client factory is not callable.
+            ValueError: If the service name, a tool name, or an option value is
+                not valid.
+            TypeError: If the client factory is not callable, or an override
+                sets a connector-owned option.
         """
         if not self.service.strip() or self.service.startswith(_RESERVED_PREFIX):
             raise ValueError(
@@ -72,6 +92,28 @@ class Upstream:
             raise TypeError(
                 f"Upstream {self.service!r}: client_factory must be callable"
             )
+        # Copy, so later changes by the caller do not change the proxy.
+        overrides = {
+            name: dict(options)
+            for name, options in self.activity_options_overrides.items()
+        }
+        object.__setattr__(self, "activity_options_overrides", overrides)
+        for tool, options in overrides.items():
+            if not is_tool_name(tool):
+                raise ValueError(
+                    f"Upstream {self.service!r}: tool name {tool!r} in "
+                    "activity_options_overrides must be non-empty and not reserved"
+                )
+            for name, value in options.items():
+                if name not in _ALLOWED_ACTIVITY_OPTIONS:
+                    raise TypeError(
+                        f"Upstream {self.service!r}: tool {tool!r}: the proxy sets {name!r}, "
+                        "or start_activity does not support it"
+                    )
+                if isinstance(value, timedelta) and value < timedelta():
+                    raise ValueError(
+                        f"Upstream {self.service!r}: tool {tool!r}: {name} must not be negative"
+                    )
 
 
 @dataclass(frozen=True, kw_only=True)

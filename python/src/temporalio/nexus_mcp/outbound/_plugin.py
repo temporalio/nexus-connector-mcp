@@ -23,8 +23,6 @@ class MCPProxyPlugin(temporalio.plugin.SimplePlugin):
         Raises:
             ValueError: If there is no upstream, or two upstreams have the same
                 service name.
-            NotImplementedError: If an upstream sets an option that the proxy
-                does not implement yet.
         """
         upstreams = tuple(options.upstreams)
         if not upstreams:
@@ -34,11 +32,6 @@ class MCPProxyPlugin(temporalio.plugin.SimplePlugin):
             if u.service in services:
                 raise ValueError(f"Duplicate Upstream service {u.service!r}")
             services.add(u.service)
-        for u in upstreams:
-            if u.activity_options_overrides:
-                raise NotImplementedError(
-                    f"Upstream {u.service!r}: activity_options_overrides is not implemented yet"
-                )
         self._caches = {u.service: ToolCache(u) for u in upstreams}
         activities = [call_tool_activity(u) for u in upstreams]
         handlers = [

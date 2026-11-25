@@ -26,7 +26,13 @@ from mcp.types import (
 )
 from nexusrpc.handler._core import ServiceHandler  # pyright: ignore[reportPrivateUsage]
 
-from temporalio.common import ActivityIDConflictPolicy, ActivityIDReusePolicy, RawValue
+from temporalio.common import (
+    ActivityIDConflictPolicy,
+    ActivityIDReusePolicy,
+    Priority,
+    RawValue,
+    RetryPolicy,
+)
 from temporalio.converter import DataConverter
 from temporalio.exceptions import ActivityAlreadyStartedError, ApplicationError
 from temporalio.nexus import TemporalOperationResult, TemporalStartOperationContext
@@ -207,6 +213,20 @@ def test_plugin_validates_options() -> None:
             Upstream(service=service, client_factory=factory(fake))
     with pytest.raises(TypeError, match="callable"):
         Upstream(service="weather", client_factory=cast(Any, None))
+    with pytest.raises(ValueError, match="not reserved"):
+        Upstream(
+            service="weather",
+            client_factory=factory(fake),
+            activity_options_overrides={"list_tools": {}},
+        )
+    with pytest.raises(ValueError, match="must not be negative"):
+        Upstream(
+            service="weather",
+            client_factory=factory(fake),
+            activity_options_overrides={
+                "a": {"heartbeat_timeout": timedelta(seconds=-1)}
+            },
+        )
 
     plugin = MCPProxyPlugin(
         options=Options(
@@ -225,9 +245,91 @@ def test_plugin_validates_options() -> None:
     ]
 
 
-def test_options_that_are_not_implemented_are_rejected() -> None:
-    with pytest.raises(NotImplementedError, match="not implemented yet"):
-        setup_proxy(activity_options_overrides={"a": {}})
+@pytest.mark.parametrize(
+    "key",
+    [
+        "id",
+        "task_queue",
+        "id_conflict_policy",
+        "id_reuse_policy",
+        "rpc_metadata",
+        "rpc_timeout",
+        "result_type",
+    ],
+)
+def test_connector_owned_options_are_rejected(key: str) -> None:
+    with pytest.raises(TypeError, match="the proxy sets"):
+        Upstream(
+            service="weather",
+            client_factory=factory(FakeUpstream()),
+            activity_options_overrides={"a": {key: None}},
+        )
+
+
+def test_overrides_are_copied() -> None:
+    overrides: dict[str, dict[str, Any]] = {"a": {"summary": "first"}}
+    _, upstream, _ = setup_proxy(activity_options_overrides=overrides)
+    overrides["a"]["summary"] = "changed"
+    assert upstream.activity_options_overrides["a"]["summary"] == "first"
+
+
+def test_activity_options_defaults_and_overrides() -> None:
+    _, upstream, _ = setup_proxy(
+        activity_options_overrides={
+            "a": {
+                "start_to_close_timeout": timedelta(hours=1),
+                "heartbeat_timeout": timedelta(seconds=30),
+                "retry_policy": RetryPolicy(maximum_attempts=5),
+                "priority": Priority(priority_key=2),
+                "summary": "weather",
+            }
+        }
+    )
+    options_for = _nexus_handler._activity_options_for  # pyright: ignore[reportPrivateUsage]
+    assert options_for(upstream, "b", None, "id") == {
+        "start_to_close_timeout": timedelta(minutes=1),
+        "id": "id",
+        "id_conflict_policy": ActivityIDConflictPolicy.USE_EXISTING,
+        "id_reuse_policy": ActivityIDReusePolicy.REJECT_DUPLICATE,
+    }
+    options = options_for(upstream, "a", {"destructiveHint": True}, "id")
+    assert options["start_to_close_timeout"] == timedelta(hours=1)
+    assert options["heartbeat_timeout"] == timedelta(seconds=30)
+    assert options["retry_policy"].maximum_attempts == 5
+    assert options["priority"].priority_key == 2
+    assert options["summary"] == "weather"
+
+
+def test_none_override_uses_defaults() -> None:
+    _, upstream, _ = setup_proxy(
+        activity_options_overrides={
+            "a": {"start_to_close_timeout": None, "retry_policy": None}
+        }
+    )
+    options = _nexus_handler._activity_options_for(  # pyright: ignore[reportPrivateUsage]
+        upstream, "a", {"destructiveHint": True}, "id"
+    )
+    assert options["start_to_close_timeout"] == timedelta(minutes=1)
+    assert options["retry_policy"].maximum_attempts == 1
+
+
+@pytest.mark.parametrize(
+    ("annotations", "attempts"),
+    [
+        ({"destructiveHint": True}, 1),
+        ({"destructiveHint": True, "idempotentHint": True}, None),
+        ({"destructiveHint": True, "readOnlyHint": True}, None),
+        ({}, None),
+        (None, None),
+    ],
+)
+def test_annotations_select_retry_policy(
+    annotations: dict[str, Any] | None, attempts: int | None
+) -> None:
+    _, upstream, _ = setup_proxy()
+    options = _nexus_handler._activity_options_for(upstream, "a", annotations, "id")  # pyright: ignore[reportPrivateUsage]
+    policy = options.get("retry_policy")
+    assert (policy.maximum_attempts if policy else None) == attempts
 
 
 def test_activity_id() -> None:
@@ -371,8 +473,15 @@ async def test_worker_starts_without_discovery() -> None:
 # Tool calls
 
 
-async def test_new_start_uses_default_options_and_stable_identity() -> None:
-    _, _, plugin = setup_proxy()
+async def test_new_start_uses_options_and_stable_identity() -> None:
+    _, _, plugin = setup_proxy(
+        activity_options_overrides={
+            "a": {
+                "priority": Priority(priority_key=2),
+                "start_delay": timedelta(seconds=1),
+            }
+        }
+    )
     await tool_cache(plugin).refresh()
     client, _ = nexus_client()
     await operation_handler(plugin, "a").start_operation(
@@ -381,12 +490,13 @@ async def test_new_start_uses_default_options_and_stable_identity() -> None:
     args, kwargs = client.start_activity.call_args
     assert args[0] is call_fn(plugin)
     assert args[1] == call_tool_input("a", {"x": 1})
-    assert kwargs == {
-        "id": "mcp-outbound-weather-endpoint-weather-a-r1",
-        "id_conflict_policy": ActivityIDConflictPolicy.USE_EXISTING,
-        "id_reuse_policy": ActivityIDReusePolicy.REJECT_DUPLICATE,
-        "start_to_close_timeout": timedelta(minutes=1),
-    }
+    assert kwargs["id"] == "mcp-outbound-weather-endpoint-weather-a-r1"
+    assert kwargs["id_conflict_policy"] == ActivityIDConflictPolicy.USE_EXISTING
+    assert kwargs["id_reuse_policy"] == ActivityIDReusePolicy.REJECT_DUPLICATE
+    assert kwargs["start_to_close_timeout"] == timedelta(minutes=1)
+    assert kwargs["retry_policy"].maximum_attempts == 1  # destructiveHint
+    assert kwargs["priority"].priority_key == 2
+    assert kwargs["start_delay"] == timedelta(seconds=1)
 
 
 async def test_unknown_tool_and_missing_discovery() -> None:
